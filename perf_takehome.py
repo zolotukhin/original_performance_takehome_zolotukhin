@@ -348,8 +348,20 @@ class KernelBuilder:
                 all_broadcasts.append(("vbroadcast", hash_mul_v[hi], mul_scalars[hi][1]))
 
         # Pack: 2 const loads + 6 vbroadcasts per cycle while we have both
+        # Pre-compute ALU ops for block offsets (split by dependency)
+        # Ops using eight_const and sixteen_const can run after cycle 24
+        # Ops using twentyfour_const must wait until cycle 26 (after it's loaded in cycle 25)
+        early_alu_ops = []  # ops using eight_const or sixteen_const
+        late_alu_ops = []   # ops using twentyfour_const
+        for base_idx in base_indices:
+            base_addr = block_off_addrs[base_idx]
+            early_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
+            early_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
+            late_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
+
         bc_idx = 0
         rem_idx = 0
+        early_alu_idx = 0
         while bc_idx < len(all_broadcasts) or rem_idx < len(remaining_block_loads):
             bundle = {}
 
@@ -370,28 +382,29 @@ class KernelBuilder:
             if load_ops:
                 bundle["load"] = load_ops
 
+            # Add early ALU ops to the last bundle (when twentyfour_const is being loaded)
+            # This is the cycle where rem_idx points past the last load (or is at twentyfour)
+            if rem_idx >= len(remaining_block_loads) and early_alu_idx < len(early_alu_ops):
+                alu_chunk = early_alu_ops[early_alu_idx:early_alu_idx + SLOT_LIMITS["alu"]]
+                if alu_chunk:
+                    bundle["alu"] = alu_chunk
+                    early_alu_idx += len(alu_chunk)
+
             if bundle:
                 self.add_packed(bundle)
 
-        # Compute remaining block offsets using ALU adds from the base offsets.
-        # Combine last ALU cycle with pause to save 1 cycle
-        offset_alu_ops = []
-        last_base_idx = base_indices[-1] if base_indices else None
-        for base_idx in base_indices:
-            base_addr = block_off_addrs[base_idx]
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
-            if len(offset_alu_ops) == SLOT_LIMITS["alu"]:
-                # If this is the last flush, combine with pause
-                if base_idx == last_base_idx:
-                    self.add_packed({"alu": offset_alu_ops, "flow": [("pause",)]})
-                else:
-                    self.add_packed({"alu": offset_alu_ops})
-                offset_alu_ops = []
-        if offset_alu_ops:
-            # Combine remaining ALU ops with pause
-            self.add_packed({"alu": offset_alu_ops, "flow": [("pause",)]})
+        # Combine remaining early ALU ops with late ALU ops and pause
+        remaining_early = early_alu_ops[early_alu_idx:]
+        all_remaining_alu = remaining_early + late_alu_ops
+        # These should fit in one or two cycles depending on count
+        while all_remaining_alu:
+            chunk = all_remaining_alu[:SLOT_LIMITS["alu"]]
+            all_remaining_alu = all_remaining_alu[SLOT_LIMITS["alu"]:]
+            if not all_remaining_alu:
+                # Last chunk, add pause
+                self.add_packed({"alu": chunk, "flow": [("pause",)]})
+            else:
+                self.add_packed({"alu": chunk})
         body_instrs = []
 
         buffers = []
