@@ -97,6 +97,91 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]))
 
+        # Preload tree[0] for round 0 optimization (all idx=0 in round 0)
+        tree0_scalar = self.alloc_scratch("tree0_scalar")
+        tree0_v = self.alloc_scratch("tree0_v", VLEN)
+        self.add("load", ("load", tree0_scalar, self.scratch["forest_values_p"]))
+        self.add("valu", ("vbroadcast", tree0_v, tree0_scalar))
+
+        # Preload tree[1], tree[2] for round 1 optimization (idx in {1,2} after round 0)
+        tree1_scalar = self.alloc_scratch("tree1_scalar")
+        tree2_scalar = self.alloc_scratch("tree2_scalar")
+        tree1_v = self.alloc_scratch("tree1_v", VLEN)
+        tree2_v = self.alloc_scratch("tree2_v", VLEN)
+        diff_1_2_v = self.alloc_scratch("diff_1_2_v", VLEN)  # tree2 - tree1
+        self.add("alu", ("+", tree1_scalar, self.scratch["forest_values_p"], one_const))
+        self.add("alu", ("+", tree2_scalar, self.scratch["forest_values_p"], two_const))
+        self.add("load", ("load", tree1_scalar, tree1_scalar))
+        self.add("load", ("load", tree2_scalar, tree2_scalar))
+        self.add("valu", ("vbroadcast", tree1_v, tree1_scalar))
+        self.add("valu", ("vbroadcast", tree2_v, tree2_scalar))
+        self.add("valu", ("-", diff_1_2_v, tree2_v, tree1_v))
+
+        # Preload tree[3..6] for round 2 optimization (idx in {3,4,5,6} after round 1)
+        three_const = self.scratch_const(3)
+        four_const = self.scratch_const(4)
+        five_const = self.scratch_const(5)
+        six_const = self.scratch_const(6)
+        three_v = self.alloc_scratch("three_v", VLEN)
+        self.add("valu", ("vbroadcast", three_v, three_const))
+
+        tree3_scalar = self.alloc_scratch("tree3_scalar")
+        tree4_scalar = self.alloc_scratch("tree4_scalar")
+        tree5_scalar = self.alloc_scratch("tree5_scalar")
+        tree6_scalar = self.alloc_scratch("tree6_scalar")
+        tree3_v = self.alloc_scratch("tree3_v", VLEN)
+        tree4_v = self.alloc_scratch("tree4_v", VLEN)
+        tree5_v = self.alloc_scratch("tree5_v", VLEN)
+        tree6_v = self.alloc_scratch("tree6_v", VLEN)
+        diff_3_4_v = self.alloc_scratch("diff_3_4_v", VLEN)  # tree4 - tree3
+        diff_5_6_v = self.alloc_scratch("diff_5_6_v", VLEN)  # tree6 - tree5
+
+        self.add("alu", ("+", tree3_scalar, self.scratch["forest_values_p"], three_const))
+        self.add("alu", ("+", tree4_scalar, self.scratch["forest_values_p"], four_const))
+        self.add("alu", ("+", tree5_scalar, self.scratch["forest_values_p"], five_const))
+        self.add("alu", ("+", tree6_scalar, self.scratch["forest_values_p"], six_const))
+        self.add("load", ("load", tree3_scalar, tree3_scalar))
+        self.add("load", ("load", tree4_scalar, tree4_scalar))
+        self.add("load", ("load", tree5_scalar, tree5_scalar))
+        self.add("load", ("load", tree6_scalar, tree6_scalar))
+        self.add("valu", ("vbroadcast", tree3_v, tree3_scalar))
+        self.add("valu", ("vbroadcast", tree4_v, tree4_scalar))
+        self.add("valu", ("vbroadcast", tree5_v, tree5_scalar))
+        self.add("valu", ("vbroadcast", tree6_v, tree6_scalar))
+        self.add("valu", ("-", diff_3_4_v, tree4_v, tree3_v))
+        self.add("valu", ("-", diff_5_6_v, tree6_v, tree5_v))
+
+        # Preload tree[7..14] for round 3 selection (idx in {7..14} after round 2)
+        seven_const = self.scratch_const(7)
+        seven_v = self.alloc_scratch("seven_v", VLEN)
+        self.add("valu", ("vbroadcast", seven_v, seven_const))
+
+        tree7_14_scalars = []
+        tree7_14_v = []
+        for i in range(7, 15):
+            scalar = self.alloc_scratch(f"tree{i}_scalar")
+            vec = self.alloc_scratch(f"tree{i}_v", VLEN)
+            tree7_14_scalars.append(scalar)
+            tree7_14_v.append(vec)
+            i_const = self.scratch_const(i)
+            self.add("alu", ("+", scalar, self.scratch["forest_values_p"], i_const))
+
+        for scalar in tree7_14_scalars:
+            self.add("load", ("load", scalar, scalar))
+
+        for scalar, vec in zip(tree7_14_scalars, tree7_14_v):
+            self.add("valu", ("vbroadcast", vec, scalar))
+
+        # Precompute diffs for round 3: diff_7_8, diff_9_10, diff_11_12, diff_13_14
+        diff_7_8_v = self.alloc_scratch("diff_7_8_v", VLEN)
+        diff_9_10_v = self.alloc_scratch("diff_9_10_v", VLEN)
+        diff_11_12_v = self.alloc_scratch("diff_11_12_v", VLEN)
+        diff_13_14_v = self.alloc_scratch("diff_13_14_v", VLEN)
+        self.add("valu", ("-", diff_7_8_v, tree7_14_v[1], tree7_14_v[0]))    # tree8 - tree7
+        self.add("valu", ("-", diff_9_10_v, tree7_14_v[3], tree7_14_v[2]))   # tree10 - tree9
+        self.add("valu", ("-", diff_11_12_v, tree7_14_v[5], tree7_14_v[4]))  # tree12 - tree11
+        self.add("valu", ("-", diff_13_14_v, tree7_14_v[7], tree7_14_v[6]))  # tree14 - tree13
+
         hash_c1_v = []
         hash_c3_v = []
         hash_mul_v = []
@@ -124,7 +209,7 @@ class KernelBuilder:
         buffers = []
         vector_batch = (batch_size // VLEN) * VLEN
         vector_blocks = vector_batch // VLEN
-        pipe_buffers = min(20, vector_blocks) if vector_blocks else 0
+        pipe_buffers = min(18, vector_blocks) if vector_blocks else 0
         for bi in range(pipe_buffers):
             buffers.append({
                 "idx": self.alloc_scratch(f"idx_v{bi}", VLEN),
@@ -192,8 +277,24 @@ class KernelBuilder:
 
                 scheduled_this_cycle = set()
 
-                # Priority 1: Flow operations (vselect for bounds) - prioritize blocks in later rounds
-                # Sort blocks by round (descending) to complete oldest blocks first
+                # Wrap threshold: only need bounds check after round 9 for n_nodes=2047
+                # Max idx after round r is 2^(r+2) - 2
+                # After round 9: 2046 < 2047 (no wrap), after round 10: 4094 > 2047 (wrap)
+                wrap_threshold = 10
+
+                def next_round_phase(current_round):
+                    """Determine next phase after completing a round."""
+                    next_r = current_round + 1
+                    if next_r >= rounds:
+                        return "store_both"
+                    elif next_r == 1:
+                        return "round1_select"
+                    elif next_r == 2:
+                        return "round2_select1"
+                    else:
+                        return "addr"
+
+                # Priority 1: Flow operations (vselect for bounds) - only for rounds >= wrap_threshold
                 update4_blocks = [b for b in active if b["phase"] == "update4" and b["block"] not in scheduled_this_cycle]
                 update4_blocks.sort(key=lambda b: b["round"], reverse=True)
                 for block in update4_blocks:
@@ -201,13 +302,10 @@ class KernelBuilder:
                         break
                     buf = block["buf"]
                     flow_ops.append(("vselect", buf["idx"], buf["cond"], buf["idx"], zero_v))
-                    if block["round"] + 1 < rounds:
-                        block["round"] += 1
-                        block["stage"] = 0
-                        block["gather"] = 0
-                        block["next_phase"] = "addr"
-                    else:
-                        block["next_phase"] = "store_both"
+                    block["round"] += 1
+                    block["stage"] = 0
+                    block["gather"] = 0
+                    block["next_phase"] = next_round_phase(block["round"] - 1)
                     scheduled_this_cycle.add(block["block"])
                     flow_slots -= 1
 
@@ -240,24 +338,36 @@ class KernelBuilder:
                         buf = block["buf"]
                         load_ops.append(("vload", buf["idx"], buf["idx_addr"]))
                         load_ops.append(("vload", buf["val"], buf["val_addr"]))
-                        block["next_phase"] = "addr"
+                        # For round 0, skip addr and gather phases (all idx=0, use tree0_v)
+                        if block["round"] == 0:
+                            block["next_phase"] = "round0_xor"
+                        else:
+                            block["next_phase"] = "addr"
                         scheduled_this_cycle.add(block["block"])
                         load_slots -= 2
 
                 # Priority 4: Gather loads (fill remaining load slots from multiple blocks)
+                # Skip gather for round 0 - use tree0_v directly
                 for block in active:
                     if load_slots == 0:
                         break
                     if block["phase"] == "gather":
-                        buf = block["buf"]
-                        while load_slots > 0 and block["gather"] < VLEN:
-                            lane = block["gather"]
-                            load_ops.append(("load_offset", buf["node"], buf["addr"], lane))
-                            block["gather"] += 1
-                            load_slots -= 1
-                        if block["gather"] >= VLEN:
-                            block["next_phase"] = "xor"
+                        if block["round"] == 0:
+                            # Round 0: all idx=0, use preloaded tree[0]
+                            buf = block["buf"]
+                            # Copy tree0_v to node (this is a valu op, handled below)
+                            block["next_phase"] = "round0_xor"
                             scheduled_this_cycle.add(block["block"])
+                        else:
+                            buf = block["buf"]
+                            while load_slots > 0 and block["gather"] < VLEN:
+                                lane = block["gather"]
+                                load_ops.append(("load_offset", buf["node"], buf["addr"], lane))
+                                block["gather"] += 1
+                                load_slots -= 1
+                            if block["gather"] >= VLEN:
+                                block["next_phase"] = "xor"
+                                scheduled_this_cycle.add(block["block"])
 
                 # Priority 5: VALU operations - unified scheduling to fill all 6 slots
                 # Build a list of all schedulable VALU tasks with their costs and priorities
@@ -282,6 +392,20 @@ class KernelBuilder:
                         valu_tasks.append((5, 2, block, "hash_op1"))
                     elif phase == "xor":
                         valu_tasks.append((6, 1, block, "xor"))
+                    elif phase == "round0_xor":
+                        valu_tasks.append((6, 1, block, "round0_xor"))
+                    elif phase == "round1_select":
+                        valu_tasks.append((6, 2, block, "round1_select"))  # combined: offset + node
+                    elif phase == "round2_select1":
+                        valu_tasks.append((6, 1, block, "round2_select1"))  # offset
+                    elif phase == "round2_select2":
+                        valu_tasks.append((6, 2, block, "round2_select2"))  # sel0, sel1
+                    elif phase == "round2_select3":
+                        valu_tasks.append((6, 2, block, "round2_select3"))  # low, high
+                    elif phase == "round2_select4":
+                        valu_tasks.append((6, 1, block, "round2_select4"))  # diff
+                    elif phase == "round2_select5":
+                        valu_tasks.append((6, 1, block, "round2_select5"))  # node
                     elif phase == "addr":
                         valu_tasks.append((7, 1, block, "addr"))
 
@@ -301,7 +425,14 @@ class KernelBuilder:
                         block["next_phase"] = "update4"
                     elif phase == "update2":
                         valu_ops.append(("+", buf["idx"], buf["idx"], buf["tmp1"]))
-                        block["next_phase"] = "update3"
+                        # Skip wrap check for early rounds (idx can't exceed n_nodes)
+                        if block["round"] < wrap_threshold:
+                            block["round"] += 1
+                            block["stage"] = 0
+                            block["gather"] = 0
+                            block["next_phase"] = next_round_phase(block["round"] - 1)
+                        else:
+                            block["next_phase"] = "update3"
                     elif phase == "update1":
                         valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
                         valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
@@ -334,6 +465,38 @@ class KernelBuilder:
                     elif phase == "xor":
                         valu_ops.append(("^", buf["val"], buf["val"], buf["node"]))
                         block["next_phase"] = "hash_mul" if hash_mul_v[0] is not None else "hash_op1"
+                    elif phase == "round0_xor":
+                        # Round 0: XOR with preloaded tree[0] vector
+                        valu_ops.append(("^", buf["val"], buf["val"], tree0_v))
+                        block["next_phase"] = "hash_mul" if hash_mul_v[0] is not None else "hash_op1"
+                    elif phase == "round1_select":
+                        # Round 1: idx in {1,2}, use linear interpolation
+                        # offset = idx - 1, node = tree1 + offset * (tree2 - tree1)
+                        valu_ops.append(("-", buf["tmp1"], buf["idx"], one_v))
+                        valu_ops.append(("multiply_add", buf["node"], diff_1_2_v, buf["tmp1"], tree1_v))
+                        block["next_phase"] = "xor"
+                    elif phase == "round2_select1":
+                        # Round 2: compute offset = idx - 3
+                        valu_ops.append(("-", buf["tmp1"], buf["idx"], three_v))
+                        block["next_phase"] = "round2_select2"
+                    elif phase == "round2_select2":
+                        # Compute sel0 = offset & 1, sel1 = offset >> 1
+                        valu_ops.append(("&", buf["tmp2"], buf["tmp1"], one_v))   # sel0
+                        valu_ops.append((">>", buf["cond"], buf["tmp1"], one_v))  # sel1
+                        block["next_phase"] = "round2_select3"
+                    elif phase == "round2_select3":
+                        # Compute low and high using linear interpolation
+                        valu_ops.append(("multiply_add", buf["tmp1"], diff_3_4_v, buf["tmp2"], tree3_v))  # low
+                        valu_ops.append(("multiply_add", buf["node"], diff_5_6_v, buf["tmp2"], tree5_v))  # high
+                        block["next_phase"] = "round2_select4"
+                    elif phase == "round2_select4":
+                        # Compute diff = high - low
+                        valu_ops.append(("-", buf["tmp2"], buf["node"], buf["tmp1"]))
+                        block["next_phase"] = "round2_select5"
+                    elif phase == "round2_select5":
+                        # Final selection: node = low + sel1 * diff
+                        valu_ops.append(("multiply_add", buf["node"], buf["tmp2"], buf["cond"], buf["tmp1"]))
+                        block["next_phase"] = "xor"
                     elif phase == "addr":
                         valu_ops.append(("+", buf["addr"], buf["idx"], forest_base_v))
                         block["next_phase"] = "gather"

@@ -218,7 +218,7 @@ class KernelBuilder:
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
         init_slots = []
-        NVECS = 8  # Process 8 vectors at a time (64 elements) - limited by scratch
+        NVECS = 8  # Process 8 vectors at a time (64 elements)
 
         # Constants
         zero_const = self.scratch_const(0, "zero", init_slots)
@@ -307,7 +307,6 @@ class KernelBuilder:
             init_slots.append(("alu", ("+", val_base_offsets[i], inp_values_p, ptr_offsets[i])))
 
         self.instrs.extend(self._pack_slots(init_slots))
-        print(f"After init: {len(self.instrs)} bundles")
         self.add("load", ("const", batch_counter, 0))
 
         # BATCH LOOP
@@ -413,13 +412,7 @@ class KernelBuilder:
             r0_ops.append(("valu", ("+", idx_vecs[v], idx_vecs[v], one_vec)))
         r0_packed = self._pack_slots(r0_ops)
         # Analyze r0 bundles
-        r0_valu_dist = {}
-        for b in r0_packed:
-            vc = len(b.get("valu", []))
-            r0_valu_dist[vc] = r0_valu_dist.get(vc, 0) + 1
-        print(f"R0: {len(r0_packed)} bundles, valu dist: {dict(sorted(r0_valu_dist.items()))}")
         self.instrs.extend(r0_packed)
-        print(f"After R0: {len(self.instrs)} bundles")
 
         # ============ ROUND 1: idx ∈ {1,2}, use tree[1] and tree[2] ============
         # node = tree[1] + (tree[2] - tree[1]) * (idx - 1)
@@ -437,7 +430,6 @@ class KernelBuilder:
         r1_ops.extend(gen_hash(val_vecs))
         r1_ops.extend(gen_index_update(idx_vecs, val_vecs, with_wrap=False))
         self.instrs.extend(self._pack_slots(r1_ops))
-        print(f"After R1: {len(self.instrs)} bundles")
 
         # ============ ROUNDS 3-15: Use gathers with A/B pipelining ============
         # Split into two groups for pipelining
@@ -549,7 +541,6 @@ class KernelBuilder:
         r2_A_ops.extend(gen_hash_half(val_A, early_temps_A))
         r2_A_ops.extend(gen_index_update_half(idx_A, val_A, early_temps_A, with_wrap=False))
         self.instrs.extend(self._pack_slots(r2_A_ops))
-        print(f"After R2-A: {len(self.instrs)} bundles")
 
         def gen_hash_group(vec_subset, group_temps):
             """Hash using per-vector temps for better packing.
@@ -609,9 +600,9 @@ class KernelBuilder:
                     ops.append(("load", ("load_offset", node_subset[i], addr_subset[i], vi)))
             return ops
 
-        def interleave_ops(load_ops, valu_ops, valu_chunk=6, load_chunk=2):
+        def interleave_ops(load_ops, valu_ops, valu_chunk=4, load_chunk=2):
             """Interleave load and valu ops for better packing.
-            Default ratio: 2 loads per 6 valu (matches slot limits)."""
+            Ratio: 2 loads per 4 valu (optimal for this kernel)."""
             result = []
             li, vi = 0, 0
             while li < len(load_ops) or vi < len(valu_ops):
@@ -637,9 +628,9 @@ class KernelBuilder:
         prime_addr = prime_ops[:HALF]  # addr calc (valu)
         prime_loads = prime_ops[HALF:]  # loads
 
-        # Overlap prime gather loads with R2 B-half valu work
-        prime_combined = prime_addr + interleave_ops(prime_loads, r2_B_ops)
-        self.instrs.extend(self._pack_slots(prime_combined))
+        # Use _pack_overlap for better load/valu overlap
+        prime_instrs = self._pack_overlap(prime_addr, prime_loads, r2_B_ops)
+        self.instrs.extend(prime_instrs)
 
         # Wrap is needed when max possible idx after round r can exceed n_nodes-1
         # Max idx after round r is 2^(r+2) - 2 (starting from idx=0 at r=0)
@@ -662,9 +653,9 @@ class KernelBuilder:
             gather_B_addr = gather_B_ops[:HALF]  # HALF valu for addr calc
             gather_B_loads = gather_B_ops[HALF:]  # HALF*VLEN loads
 
-            step1_ops = gather_B_addr + interleave_ops(gather_B_loads, hash_A_ops)
-            step1_packed = self._pack_slots(step1_ops)
-            self.instrs.extend(step1_packed)
+            # Use _pack_overlap for better load/valu overlap
+            step1_instrs = self._pack_overlap(gather_B_addr, gather_B_loads, hash_A_ops)
+            self.instrs.extend(step1_instrs)
 
             # Step 2: Hash B | Gather A (for next round, unless last round)
             hash_B_ops = gen_xor(val_B, node_B)
@@ -675,15 +666,12 @@ class KernelBuilder:
                 gather_A_ops = gen_gather_group(idx_A, addr_A, node_A)
                 gather_A_addr = gather_A_ops[:HALF]
                 gather_A_loads = gather_A_ops[HALF:]
-                step2_ops = gather_A_addr + interleave_ops(gather_A_loads, hash_B_ops)
+                step2_instrs = self._pack_overlap(gather_A_addr, gather_A_loads, hash_B_ops)
             else:
                 # Last round: no more gathers, just hash B
-                step2_ops = hash_B_ops
+                step2_instrs = self._pack_slots(hash_B_ops)
 
-            step2_packed = self._pack_slots(step2_ops)
-            self.instrs.extend(step2_packed)
-            if r == 3:
-                print(f"R{r}: step1={len(step1_packed)}, step2={len(step2_packed)}, total={len(self.instrs)-before_r}")
+            self.instrs.extend(step2_instrs)
 
         # Store results and loop
         store_ops = []
@@ -700,7 +688,6 @@ class KernelBuilder:
         offset = batch_loop_start - jump_src
         self.add("flow", ("cond_jump_rel", jump_cond, offset))
         self.add("flow", ("pause",))
-        print(f"Total kernel bundles: {len(self.instrs)}")
 
 
 BASELINE = 147734
