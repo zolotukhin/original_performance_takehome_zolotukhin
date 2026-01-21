@@ -7,29 +7,145 @@
 
 ## Current Status
 - Baseline (frozen harness): 147734 cycles.
-- **perf_takehome.py: 1872 cycles** (78.92x speedup) - Dynamic scheduler + rounds 0-3 selection + priority tuning + 10 buffers
-- **solution.py: 2193 cycles** (67.37x speedup) - Hash fusion + reordering + _pack_overlap
-- Target: <1363 cycles (still need ~1.37x improvement)
+- **solution_new.py: 1474 cycles** (100.23x speedup) - Depth-based selection + ALU offloading
+- Target: <1363 cycles (108.4x speedup) - need ~7.5% more improvement
 
-### Fundamental Bottleneck Analysis (1872 cycles)
+---
+
+# Current Best: 1474 cycles (solution_new.py)
+
+## Key Optimizations
+
+### 1. Depth-Based Selection (Rounds 0-2, 11-13)
+Instead of gather loads (8 cycles per lookup), use preloaded tree values with linear interpolation:
+
+- **Depth 0 (rounds 0, 11)**: All indices start at 0 or reset after wrap, use preloaded `tree0_v`
+- **Depth 1 (rounds 1, 12)**: idx in {1,2}, use `tree1_v + (idx-1) * diff_1_2_v`
+- **Depth 2 (rounds 2, 13)**: idx in {3-6}, use 2-level selection with `tree3-6_v`
+- **Depth 3+ (rounds 3-10, 14-15)**: Use gather (selection overhead exceeds gather cost)
+
+Key insight: After wrap at round 10, indices reset to 0, so rounds 11-13 can reuse depth 0-2 selection.
+
+### 2. Wrap Threshold Optimization
+Only round 10 needs bounds checking (vselect). Before wrap (rounds 0-9), indices can't exceed n_nodes. After wrap (rounds 11-15), indices reset to 0 and grow small again.
+
+### 3. ALU-Based Block Offset Computation
+Instead of loading all 32 block offsets (0, 8, 16, ... 248), load only base offsets (every 4th) plus constants 8, 16, 24, then compute the rest with ALU adds.
+
+### 4. Hash Stage Fusion
+For hash stages with pattern `(+, val1, +, <<, val3)`, fuse into single `multiply_add` with multiplier `(1 + (1 << val3))`.
+
+### 5. Hash Op1 ALU Offloading
+When VALU is saturated but scalar ALU has slots, offload op3 (shift) to 8 scalar ALU ops instead of 1 VALU op.
+
+### 6. Preamble Bundling
+- Pack const loads 2 per cycle
+- Interleave vbroadcasts with independent loads
+- Overlap tree address ALU ops with loads
+
+### 7. Dynamic Pipeline Scheduling
+- 13 pipeline buffers (optimal for this workload)
+- Priority-based VALU scheduling:
+  - Priority 0-2: update3 → update2 → update1 (completion path)
+  - Priority 3: hash_mul (high throughput)
+  - Priority 4: round2_select2 (sel1 computation)
+  - Priority 5: hash_op1, addr
+  - Priority 6-7: selection phases, xor
+
+## Phase State Machine
+```
+Round 0: init_addr → vload → round0_xor → hash → update1 → update2 → [next]
+Round 1: round1_select → xor → hash → update1 → update2 → [next]
+Round 2: round2_select1-5 → xor → hash → update1 → update2 → [next]
+Rounds 3-9: addr → gather → xor → hash → update1 → update2 → [next]
+Round 10: addr → gather → xor → hash → update1 → update2 → update3 → update4 → [next]
+Rounds 11-13: Same as depths 0-2 (selection after wrap)
+Rounds 14-15: addr → gather → xor → hash → update1 → update2 → [next]
+Final: store_both → store_idx → done
+```
+
+## Files
+- `solution_new.py` - Current optimized kernel (1474 cycles)
+- `perf_takehome.py` - Original baseline
+- `1474.diff` - Diff from baseline to current solution
+- `1823.py` - Previous version with round 3 selection (reference)
+
+## Potential Further Optimizations
+
+### Depth 3 Selection (from 1823.py - may help)
+Add selection for rounds 3 and 14 (depth 3) using preloaded `tree7-14_v`. This requires:
+- 8 additional tree value broadcasts
+- 4 diff vectors (diff_7_8, diff_9_10, diff_11_12, diff_13_14)
+- ~12 VALU cycles per selection (vs 8 gather cycles)
+
+Trade-off: May increase VALU pressure but saves gather load slots.
+
+### Priority Tuning
+Further fine-tuning of phase priorities to maximize slot utilization.
+
+---
+
+# Historical Notes (Previous Approaches)
+
+### Recent Optimization: Init Bundling (1823 → 1786, 37 cycles saved)
+- Pre-created all constants (tree indices 0-14, hash constants, block offsets) in batched operations
+- Bundled constant loads in pairs (2 per cycle instead of 1)
+- Bundled init_vars loads in pairs
+- Bundled tree0 vbroadcast with other initial vbroadcasts (6 ops per cycle)
+- Bundled tree3-6 diffs with tree7-14 diffs (6 ops per cycle)
+- Bundled diff_1_2 with three_v vbroadcast
+- Moved all const loads from body to init (0 const loads in body now)
+- Init phase: 55 instructions, Body: 1731 instructions
+- Wasted VALU slots reduced from 1024 to 850
+
+### Why <1363 cycles appears impossible
+- Theoretical load minimum: 3219 loads / 2 per cycle = **1610 cycles**
+- This minimum is **ABOVE** the target of 1363 cycles
+- Would need to eliminate ~493 loads (~2 rounds of gather) to reach target
+- Round 4+ selection attempted but failed due to VALU overhead exceeding gather cost
+
+### Recent Optimization: Init Phase Bundling (1872 → 1823, 49 cycles saved)
+- Replaced individual `self.add()` calls with explicit instruction bundling
+- Bundled multiple vbroadcasts together (6 per cycle max)
+- Bundled ALU ops for tree address computations
+- Bundled loads where possible (2 per cycle max)
+- Better packing during init phase reduces overhead
+
+### Fundamental Bottleneck Analysis (1823 cycles)
 - **Load ops**: 3219 (vload 64 + gather 3072 + setup 83)
 - **VALU ops**: 9580
 - **Theoretical load minimum**: 3219 / 2 = 1609.5 cycles
 - **Theoretical VALU minimum**: 9580 / 6 = 1596.7 cycles
-- **Actual**: 1872 cycles (16% overhead from dependencies and suboptimal scheduling)
+- **Actual**: 1823 cycles (13% overhead from dependencies and phase synchronization)
+
+### Slot Utilization Analysis (1823 cycles)
+- **VALU slots**: 75.8% full (6/6), 10.8% partial (4-5), 8.6% low (1-3), 4.8% empty
+- **LOAD slots**: 86.3% full (2/2), 3.8% partial (1), 9.9% empty
+- **Wasted VALU slots**: 1364 (could theoretically fit 227 more cycles of work)
+- **88 load-only cycles**: During gather phases, all active blocks need loads, no VALU work available
 
 ### Why <1363 cycles is very difficult
 - Theoretical load minimum (1609.5) is already ABOVE target (1363)
 - To reach 1363 at 2 loads/cycle, need max 2726 loads
 - Currently have 3219 loads → need to eliminate 493 loads (~2 rounds of gather)
-- Round 4 selection (16 values) failed due to scratch space constraints
-- Each additional selection level doubles complexity and scratch requirements
+- Buffer count optimization: 10 buffers is sweet spot (8=1909, 9=1886, 10=1823, 11=1869, 12=1866)
 
-### Slot Utilization
-- VALU: 85.2% utilized
-- LOAD: 85.9% utilized
-- Flow: 10.4% utilized (192 vselects for bounds checking in rounds 10-15)
-- 206 suboptimal cycles (11%) where neither slot type is saturated
+### Round 4 Selection Attempt (FAILED - Made Performance Worse)
+- **Goal**: Eliminate round 4 gathers (32 blocks × 8 lanes = 256 loads = 128 cycles)
+- **Approach**: 4-level binary selection tree for indices 15-30 (16 values)
+- **Implementation**:
+  - Preloaded tree[15..30] (16 scalars + 16 vectors + 8 diffs)
+  - Added tmp3-tmp6 registers to each buffer for intermediate results
+  - Implemented 15 selection phases to avoid RAW hazards
+- **Result**: 1823 → 2026 cycles (203 cycles WORSE)
+- **Root cause**: RAW hazard separation required 15+ phases with only 1-5 ops each
+  - Each binary selection level needs: (compute inputs) → (compute diff) → (multiply_add)
+  - 4 levels × 2 phases + selector computation = 10+ phases minimum
+  - With poor VALU utilization per phase, overhead exceeds gather cost
+- **Conclusion**: Round 4 selection is fundamentally more expensive than gathers
+  - 256 loads at 2/cycle = 128 cycles (with good overlap via pipelining)
+  - 864 VALU ops spread across 15 phases with dependencies = 150+ cycles
+  - Reduced buffers (8 vs 10) due to scratch space further hurt pipelining
 
 ### Recent Changes (Session)
 1. Ported dynamic scheduler from solution_new.py to perf_takehome.py → 2076 cycles
@@ -123,7 +239,9 @@ Final: store_both → store_idx → done
 - **Effect**: Reduces scheduling overhead and allows better parallelism
 
 ### Saved Diffs
-- `1872.py`: Current best (1872 cycles, 10 buffers)
+- `1823.py`: Current best (1823 cycles, init phase bundling)
+- `1823.diff`: Diff from original to 1823 cycles version
+- `1872.py`: Previous best (1872 cycles, 10 buffers)
 - `1874.py`: Hash priority (1874 cycles, 17 buffers)
 - `1946.py`: Xor priority (1946 cycles)
 - `1972.py`: Addr priority (1972 cycles)
