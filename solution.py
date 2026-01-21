@@ -445,16 +445,34 @@ class KernelBuilder:
                 if next_block >= vector_blocks or not free_bufs:
                     return False
                 buf_idx = free_bufs.pop(0)
-                active.append({
-                    "block": next_block,
-                    "buf_idx": buf_idx,
-                    "buf": buffers[buf_idx],
-                    "offset": block_offsets[next_block],
-                    "phase": "init_addr",
-                    "round": 0,
-                    "stage": 0,
-                    "gather": 0,
-                })
+                buf = buffers[buf_idx]
+                # Optimization: block 0's offset is 0, so idx_addr = inp_indices_p, val_addr = inp_values_p
+                # Skip init_addr phase and go directly to vload
+                if next_block == 0:
+                    active.append({
+                        "block": next_block,
+                        "buf_idx": buf_idx,
+                        "buf": buf,
+                        "offset": block_offsets[next_block],
+                        "phase": "vload",  # Skip init_addr for block 0
+                        "round": 0,
+                        "stage": 0,
+                        "gather": 0,
+                        # Store direct scratch addresses for block 0's vload/vstore
+                        "direct_idx_addr": self.scratch["inp_indices_p"],
+                        "direct_val_addr": self.scratch["inp_values_p"],
+                    })
+                else:
+                    active.append({
+                        "block": next_block,
+                        "buf_idx": buf_idx,
+                        "buf": buf,
+                        "offset": block_offsets[next_block],
+                        "phase": "init_addr",
+                        "round": 0,
+                        "stage": 0,
+                        "gather": 0,
+                    })
                 next_block += 1
                 return True
 
@@ -537,7 +555,9 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_both" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        store_ops.append(("vstore", buf["val_addr"], buf["val"]))
+                        # Use direct addresses if available (block 0 optimization)
+                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+                        store_ops.append(("vstore", val_addr, buf["val"]))
                         block["next_phase"] = "store_idx"
                         scheduled_this_cycle.add(block["block"])
                         store_slots -= 1
@@ -547,7 +567,9 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_idx" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        store_ops.append(("vstore", buf["idx_addr"], buf["idx"]))
+                        # Use direct addresses if available (block 0 optimization)
+                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+                        store_ops.append(("vstore", idx_addr, buf["idx"]))
                         block["next_phase"] = "done"
                         scheduled_this_cycle.add(block["block"])
                         store_slots -= 1
@@ -558,8 +580,11 @@ class KernelBuilder:
                         break
                     if block["phase"] == "vload" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        load_ops.append(("vload", buf["idx"], buf["idx_addr"]))
-                        load_ops.append(("vload", buf["val"], buf["val_addr"]))
+                        # Use direct addresses if available (block 0 optimization)
+                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+                        load_ops.append(("vload", buf["idx"], idx_addr))
+                        load_ops.append(("vload", buf["val"], val_addr))
                         # For round 0, skip addr and gather phases (all idx=0, use tree0_v)
                         if block["round"] == 0:
                             block["next_phase"] = "round0_xor"
@@ -729,7 +754,6 @@ class KernelBuilder:
                         block["next_phase"] = "xor"
                     elif phase == "round2_select1":
                         # Round 2: compute offset = idx - 3 into tmp2 (preserve tmp1 parity)
-                        # Then compute sel1 = offset >> 1 in next cycle
                         valu_ops.append(("-", buf["tmp2"], buf["idx"], three_v))
                         block["next_phase"] = "round2_select2"
                     elif phase == "round2_select2":
