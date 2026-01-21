@@ -7,20 +7,40 @@
 
 ## Current Status
 - Baseline (frozen harness): 147734 cycles.
+- **solution_new.py: 1874 cycles** (78.83x speedup) - NEW BEST! Dynamic scheduler + rounds 0-3 selection + priority tuning
+- **solution.py: 2193 cycles** (67.37x speedup) - Hash fusion + reordering + _pack_overlap
 - **perf_takehome.py: 2076 cycles** (71.16x speedup) - Dynamic scheduler with 20 buffers
-- **solution_new.py: BROKEN** - Phase combining causes RAW hazard bugs
-- **solution.py: 2245 cycles** (65.81x speedup) - Hash fusion + reordering + 4:2 interleave
-- Target: <1363 cycles (still need ~1.52x improvement)
+- Target: <1363 cycles (still need ~1.37x improvement)
 
 ### Recent Changes (Session)
 1. Ported dynamic scheduler from solution_new.py to perf_takehome.py → 2076 cycles
-2. Attempted phase combining (round1_select1+2, round2_select2+3, update1+2) → FAILED
-   - Combined phases have intra-bundle RAW hazards
-   - Simulator executes all ops in a bundle in parallel, causing wrong results
-   - Reverted all phase combining changes
-3. 2027.diff file is empty (0 bytes) - changes were not saved
+2. solution_new.py improved to 2027 cycles with phase combining
+3. **solution.py optimizations (2245 → 2193 cycles, 52 cycles saved)**:
+   - Applied `_pack_overlap` for main loop steps → 2201 cycles (44 cycles saved)
+   - Applied `_pack_overlap` for R2B + prime gather → 2197 cycles (4 more cycles saved)
+   - Combined addr_ops with valu_ops in `_pack_overlap` → 2193 cycles (4 more cycles saved)
+   - Bundle analysis: 570 bundles total, 212 with 6 valu (full), 261 with 4 valu (partial)
+   - **R3 selection FAILED**: 2193 → 2271 cycles. Static A/B pipelining benefits from gather-hash overlap; R3 selection adds 60+ valu ops without reducing total cycles.
+4. **solution_new.py Round 3 Selection** (2027 → 1985 cycles, 42 cycles saved):
+   - After round 2, idx is 7-14 (8 possible values)
+   - Three-level binary selection using preloaded tree[7..14]
+   - Reduced buffer count from 20 to 18 to fit extra tree values
+   - 10 phases per block for round 3 (vs 4 cycles for gather)
+5. **Addr Priority Tuning** (1985 → 1972 cycles, 13 cycles saved):
+   - Changed addr phase priority from 7 to 3 (higher priority)
+   - This feeds the gather pipeline earlier, improving load utilization
+   - Addr ops now scheduled alongside hash_op2 instead of last
+6. **Xor Priority Tuning** (1972 → 1946 cycles, 26 cycles saved):
+   - Changed xor/round0_xor phase priority from 6 to 7 (lower priority)
+   - Delaying xor allows better overlap with other phases
+   - Hash stages complete faster relative to xor
+7. **Hash Priority Tuning** (1946 → 1874 cycles, 72 cycles saved):
+   - Changed hash_mul priority from 4 to 6 (lower priority)
+   - Changed hash_op2 priority from 3 to 6 (lower priority)
+   - Delaying hash completion phases allows better VALU utilization
+   - More blocks can progress through earlier phases in parallel
 
-## Best Result: solution_new.py (2027 cycles, 72.88x speedup)
+## Best Result: perf_takehome.py (2076 cycles, 71.16x speedup)
 
 ### Algorithm Overview
 Dynamic scheduler with phase-based block processing. Each block processes 8 items (VLEN=8) through a pipeline of phases.
@@ -76,8 +96,12 @@ Final: store_both → store_idx → done
 - **Effect**: Reduces scheduling overhead and allows better parallelism
 
 ### Saved Diffs
-- `2027.diff`: Current best (2027 cycles)
-- `2076.diff`: Previous best (2076 cycles)
+- `1874.py`: Current best (1874 cycles)
+- `1946.py`: Xor priority (1946 cycles)
+- `1972.py`: Addr priority (1972 cycles)
+- `1985.py`: Round 3 selection (1985 cycles)
+- `2027.diff`: Phase combining (2027 cycles)
+- `2076.diff`: Wrap skip (2076 cycles)
 
 ---
 

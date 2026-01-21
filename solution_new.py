@@ -291,6 +291,8 @@ class KernelBuilder:
                         return "round1_select"
                     elif next_r == 2:
                         return "round2_select1"
+                    elif next_r == 3:
+                        return "round3_select1"
                     else:
                         return "addr"
 
@@ -385,15 +387,15 @@ class KernelBuilder:
                     elif phase == "update1":
                         valu_tasks.append((2, 2, block, "update1"))
                     elif phase == "hash_op2":
-                        valu_tasks.append((3, 1, block, "hash_op2"))
+                        valu_tasks.append((6, 1, block, "hash_op2"))
                     elif phase == "hash_mul":
-                        valu_tasks.append((4, 1, block, "hash_mul"))
+                        valu_tasks.append((6, 1, block, "hash_mul"))
                     elif phase == "hash_op1":
                         valu_tasks.append((5, 2, block, "hash_op1"))
                     elif phase == "xor":
-                        valu_tasks.append((6, 1, block, "xor"))
+                        valu_tasks.append((7, 1, block, "xor"))
                     elif phase == "round0_xor":
-                        valu_tasks.append((6, 1, block, "round0_xor"))
+                        valu_tasks.append((7, 1, block, "round0_xor"))
                     elif phase == "round1_select":
                         valu_tasks.append((6, 2, block, "round1_select"))  # combined: offset + node
                     elif phase == "round2_select1":
@@ -406,8 +408,29 @@ class KernelBuilder:
                         valu_tasks.append((6, 1, block, "round2_select4"))  # diff
                     elif phase == "round2_select5":
                         valu_tasks.append((6, 1, block, "round2_select5"))  # node
+                    elif phase == "round3_select1":
+                        valu_tasks.append((6, 1, block, "round3_select1"))  # offset = idx - 7
+                    elif phase == "round3_select2":
+                        valu_tasks.append((6, 3, block, "round3_select2"))  # sel0, sel1, sel2
+                    elif phase == "round3_select3":
+                        valu_tasks.append((6, 3, block, "round3_select3"))  # sel1, t01, t23
+                    elif phase == "round3_select4a":
+                        valu_tasks.append((6, 1, block, "round3_select4a"))  # d01_23
+                    elif phase == "round3_select4b":
+                        valu_tasks.append((6, 1, block, "round3_select4b"))  # t0123
+                    elif phase == "round3_select5":
+                        valu_tasks.append((6, 2, block, "round3_select5"))  # t45, t67
+                    elif phase == "round3_select6a":
+                        valu_tasks.append((6, 1, block, "round3_select6a"))  # d45_67
+                    elif phase == "round3_select6b":
+                        valu_tasks.append((6, 1, block, "round3_select6b"))  # t4567
+                    elif phase == "round3_select7a":
+                        valu_tasks.append((6, 1, block, "round3_select7a"))  # diff
+                    elif phase == "round3_select7b":
+                        valu_tasks.append((6, 1, block, "round3_select7b"))  # node
                     elif phase == "addr":
-                        valu_tasks.append((7, 1, block, "addr"))
+                        # Higher priority (4) to feed gather pipeline
+                        valu_tasks.append((4, 1, block, "addr"))
 
                 # Sort by priority (lower = higher priority)
                 valu_tasks.sort(key=lambda x: x[0])
@@ -496,6 +519,51 @@ class KernelBuilder:
                     elif phase == "round2_select5":
                         # Final selection: node = low + sel1 * diff
                         valu_ops.append(("multiply_add", buf["node"], buf["tmp2"], buf["cond"], buf["tmp1"]))
+                        block["next_phase"] = "xor"
+                    elif phase == "round3_select1":
+                        # Round 3: idx in {7..14}, compute offset = idx - 7
+                        valu_ops.append(("-", buf["tmp1"], buf["idx"], seven_v))
+                        block["next_phase"] = "round3_select2"
+                    elif phase == "round3_select2":
+                        # Compute sel0, sel1*2, sel2
+                        valu_ops.append(("&", buf["tmp2"], buf["tmp1"], one_v))   # sel0 = offset & 1
+                        valu_ops.append(("&", buf["cond"], buf["tmp1"], two_v))   # sel1*2 = offset & 2
+                        valu_ops.append((">>", buf["addr"], buf["tmp1"], two_v))  # sel2 = offset >> 2
+                        block["next_phase"] = "round3_select3"
+                    elif phase == "round3_select3":
+                        # Compute sel1, t01, t23
+                        valu_ops.append((">>", buf["cond"], buf["cond"], one_v))  # sel1 = sel1*2 >> 1
+                        valu_ops.append(("multiply_add", buf["tmp1"], diff_7_8_v, buf["tmp2"], tree7_14_v[0]))   # t01
+                        valu_ops.append(("multiply_add", buf["node"], diff_9_10_v, buf["tmp2"], tree7_14_v[2]))  # t23
+                        block["next_phase"] = "round3_select4a"
+                    elif phase == "round3_select4a":
+                        # d01_23 = t23 - t01
+                        valu_ops.append(("-", buf["node"], buf["node"], buf["tmp1"]))
+                        block["next_phase"] = "round3_select4b"
+                    elif phase == "round3_select4b":
+                        # t0123 = d01_23 * sel1 + t01
+                        valu_ops.append(("multiply_add", buf["tmp1"], buf["node"], buf["cond"], buf["tmp1"]))
+                        block["next_phase"] = "round3_select5"
+                    elif phase == "round3_select5":
+                        # Compute t45, t67
+                        valu_ops.append(("multiply_add", buf["node"], diff_11_12_v, buf["tmp2"], tree7_14_v[4]))  # t45
+                        valu_ops.append(("multiply_add", buf["tmp2"], diff_13_14_v, buf["tmp2"], tree7_14_v[6]))  # t67
+                        block["next_phase"] = "round3_select6a"
+                    elif phase == "round3_select6a":
+                        # d45_67 = t67 - t45
+                        valu_ops.append(("-", buf["tmp2"], buf["tmp2"], buf["node"]))
+                        block["next_phase"] = "round3_select6b"
+                    elif phase == "round3_select6b":
+                        # t4567 = t45 + sel1 * d45_67
+                        valu_ops.append(("multiply_add", buf["node"], buf["tmp2"], buf["cond"], buf["node"]))
+                        block["next_phase"] = "round3_select7a"
+                    elif phase == "round3_select7a":
+                        # diff = t4567 - t0123
+                        valu_ops.append(("-", buf["tmp2"], buf["node"], buf["tmp1"]))
+                        block["next_phase"] = "round3_select7b"
+                    elif phase == "round3_select7b":
+                        # node = t0123 + sel2 * diff
+                        valu_ops.append(("multiply_add", buf["node"], buf["tmp2"], buf["addr"], buf["tmp1"]))
                         block["next_phase"] = "xor"
                     elif phase == "addr":
                         valu_ops.append(("+", buf["addr"], buf["idx"], forest_base_v))
