@@ -91,11 +91,14 @@ class KernelBuilder:
         two_v = self.alloc_scratch("two_v", VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
         forest_base_v = self.alloc_scratch("forest_base_v", VLEN)
-        self.add("valu", ("vbroadcast", zero_v, zero_const))
-        self.add("valu", ("vbroadcast", one_v, one_const))
-        self.add("valu", ("vbroadcast", two_v, two_const))
-        self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
-        self.add("valu", ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]))
+        # Bundle first 5 vbroadcasts (fits in 6 valu slots)
+        self.instrs.append({"valu": [
+            ("vbroadcast", zero_v, zero_const),
+            ("vbroadcast", one_v, one_const),
+            ("vbroadcast", two_v, two_const),
+            ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]),
+            ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]),
+        ]})
 
         # Preload tree[0] for round 0 optimization (all idx=0 in round 0)
         tree0_scalar = self.alloc_scratch("tree0_scalar")
@@ -109,12 +112,22 @@ class KernelBuilder:
         tree1_v = self.alloc_scratch("tree1_v", VLEN)
         tree2_v = self.alloc_scratch("tree2_v", VLEN)
         diff_1_2_v = self.alloc_scratch("diff_1_2_v", VLEN)  # tree2 - tree1
-        self.add("alu", ("+", tree1_scalar, self.scratch["forest_values_p"], one_const))
-        self.add("alu", ("+", tree2_scalar, self.scratch["forest_values_p"], two_const))
-        self.add("load", ("load", tree1_scalar, tree1_scalar))
-        self.add("load", ("load", tree2_scalar, tree2_scalar))
-        self.add("valu", ("vbroadcast", tree1_v, tree1_scalar))
-        self.add("valu", ("vbroadcast", tree2_v, tree2_scalar))
+        # Bundle ALU ops for tree1, tree2 addresses
+        self.instrs.append({"alu": [
+            ("+", tree1_scalar, self.scratch["forest_values_p"], one_const),
+            ("+", tree2_scalar, self.scratch["forest_values_p"], two_const),
+        ]})
+        # Bundle loads for tree1, tree2
+        self.instrs.append({"load": [
+            ("load", tree1_scalar, tree1_scalar),
+            ("load", tree2_scalar, tree2_scalar),
+        ]})
+        # Bundle vbroadcasts (no diff here - it has RAW hazard)
+        self.instrs.append({"valu": [
+            ("vbroadcast", tree1_v, tree1_scalar),
+            ("vbroadcast", tree2_v, tree2_scalar),
+        ]})
+        # Diff must be separate due to RAW hazard
         self.add("valu", ("-", diff_1_2_v, tree2_v, tree1_v))
 
         # Preload tree[3..6] for round 2 optimization (idx in {3,4,5,6} after round 1)
@@ -136,62 +149,99 @@ class KernelBuilder:
         diff_3_4_v = self.alloc_scratch("diff_3_4_v", VLEN)  # tree4 - tree3
         diff_5_6_v = self.alloc_scratch("diff_5_6_v", VLEN)  # tree6 - tree5
 
-        self.add("alu", ("+", tree3_scalar, self.scratch["forest_values_p"], three_const))
-        self.add("alu", ("+", tree4_scalar, self.scratch["forest_values_p"], four_const))
-        self.add("alu", ("+", tree5_scalar, self.scratch["forest_values_p"], five_const))
-        self.add("alu", ("+", tree6_scalar, self.scratch["forest_values_p"], six_const))
-        self.add("load", ("load", tree3_scalar, tree3_scalar))
-        self.add("load", ("load", tree4_scalar, tree4_scalar))
-        self.add("load", ("load", tree5_scalar, tree5_scalar))
-        self.add("load", ("load", tree6_scalar, tree6_scalar))
-        self.add("valu", ("vbroadcast", tree3_v, tree3_scalar))
-        self.add("valu", ("vbroadcast", tree4_v, tree4_scalar))
-        self.add("valu", ("vbroadcast", tree5_v, tree5_scalar))
-        self.add("valu", ("vbroadcast", tree6_v, tree6_scalar))
-        self.add("valu", ("-", diff_3_4_v, tree4_v, tree3_v))
-        self.add("valu", ("-", diff_5_6_v, tree6_v, tree5_v))
+        # Bundle ALU ops for tree3-6 addresses
+        self.instrs.append({"alu": [
+            ("+", tree3_scalar, self.scratch["forest_values_p"], three_const),
+            ("+", tree4_scalar, self.scratch["forest_values_p"], four_const),
+            ("+", tree5_scalar, self.scratch["forest_values_p"], five_const),
+            ("+", tree6_scalar, self.scratch["forest_values_p"], six_const),
+        ]})
+        # Bundle loads for tree3-6 (2 loads per cycle)
+        self.instrs.append({"load": [
+            ("load", tree3_scalar, tree3_scalar),
+            ("load", tree4_scalar, tree4_scalar),
+        ]})
+        self.instrs.append({"load": [
+            ("load", tree5_scalar, tree5_scalar),
+            ("load", tree6_scalar, tree6_scalar),
+        ]})
+        # Bundle vbroadcasts for tree3-6
+        self.instrs.append({"valu": [
+            ("vbroadcast", tree3_v, tree3_scalar),
+            ("vbroadcast", tree4_v, tree4_scalar),
+            ("vbroadcast", tree5_v, tree5_scalar),
+            ("vbroadcast", tree6_v, tree6_scalar),
+        ]})
+        # Diffs must be separate due to RAW hazard with vbroadcasts
+        self.instrs.append({"valu": [
+            ("-", diff_3_4_v, tree4_v, tree3_v),
+            ("-", diff_5_6_v, tree6_v, tree5_v),
+        ]})
 
         # Preload tree[7..14] for round 3 selection (idx in {7..14} after round 2)
         seven_const = self.scratch_const(7)
         seven_v = self.alloc_scratch("seven_v", VLEN)
-        self.add("valu", ("vbroadcast", seven_v, seven_const))
 
         tree7_14_scalars = []
         tree7_14_v = []
+        alu_ops_7_14 = []
         for i in range(7, 15):
             scalar = self.alloc_scratch(f"tree{i}_scalar")
             vec = self.alloc_scratch(f"tree{i}_v", VLEN)
             tree7_14_scalars.append(scalar)
             tree7_14_v.append(vec)
             i_const = self.scratch_const(i)
-            self.add("alu", ("+", scalar, self.scratch["forest_values_p"], i_const))
+            alu_ops_7_14.append(("+", scalar, self.scratch["forest_values_p"], i_const))
 
-        for scalar in tree7_14_scalars:
-            self.add("load", ("load", scalar, scalar))
+        # Bundle ALU ops (8 ops, fits in 12 alu slots)
+        self.instrs.append({"alu": alu_ops_7_14})
 
-        for scalar, vec in zip(tree7_14_scalars, tree7_14_v):
-            self.add("valu", ("vbroadcast", vec, scalar))
+        # Bundle loads (2 per cycle, 4 bundles)
+        for i in range(0, 8, 2):
+            self.instrs.append({"load": [
+                ("load", tree7_14_scalars[i], tree7_14_scalars[i]),
+                ("load", tree7_14_scalars[i+1], tree7_14_scalars[i+1]),
+            ]})
 
-        # Precompute diffs for round 3: diff_7_8, diff_9_10, diff_11_12, diff_13_14
+        # Bundle vbroadcasts (6 per cycle, plus seven_v)
+        self.instrs.append({"valu": [
+            ("vbroadcast", seven_v, seven_const),
+            ("vbroadcast", tree7_14_v[0], tree7_14_scalars[0]),
+            ("vbroadcast", tree7_14_v[1], tree7_14_scalars[1]),
+            ("vbroadcast", tree7_14_v[2], tree7_14_scalars[2]),
+            ("vbroadcast", tree7_14_v[3], tree7_14_scalars[3]),
+            ("vbroadcast", tree7_14_v[4], tree7_14_scalars[4]),
+        ]})
+        self.instrs.append({"valu": [
+            ("vbroadcast", tree7_14_v[5], tree7_14_scalars[5]),
+            ("vbroadcast", tree7_14_v[6], tree7_14_scalars[6]),
+            ("vbroadcast", tree7_14_v[7], tree7_14_scalars[7]),
+        ]})
+
+        # Precompute diffs for round 3 (can bundle 4 ops)
         diff_7_8_v = self.alloc_scratch("diff_7_8_v", VLEN)
         diff_9_10_v = self.alloc_scratch("diff_9_10_v", VLEN)
         diff_11_12_v = self.alloc_scratch("diff_11_12_v", VLEN)
         diff_13_14_v = self.alloc_scratch("diff_13_14_v", VLEN)
-        self.add("valu", ("-", diff_7_8_v, tree7_14_v[1], tree7_14_v[0]))    # tree8 - tree7
-        self.add("valu", ("-", diff_9_10_v, tree7_14_v[3], tree7_14_v[2]))   # tree10 - tree9
-        self.add("valu", ("-", diff_11_12_v, tree7_14_v[5], tree7_14_v[4]))  # tree12 - tree11
-        self.add("valu", ("-", diff_13_14_v, tree7_14_v[7], tree7_14_v[6]))  # tree14 - tree13
+        self.instrs.append({"valu": [
+            ("-", diff_7_8_v, tree7_14_v[1], tree7_14_v[0]),    # tree8 - tree7
+            ("-", diff_9_10_v, tree7_14_v[3], tree7_14_v[2]),   # tree10 - tree9
+            ("-", diff_11_12_v, tree7_14_v[5], tree7_14_v[4]),  # tree12 - tree11
+            ("-", diff_13_14_v, tree7_14_v[7], tree7_14_v[6]),  # tree14 - tree13
+        ]})
 
         hash_c1_v = []
         hash_c3_v = []
         hash_mul_v = []
+        hash_vbroadcasts = []
+
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1_scalar = self.scratch_const(val1)
             c1_v = self.alloc_scratch(f"hash_c1_v_{hi}", VLEN)
-            self.add("valu", ("vbroadcast", c1_v, c1_scalar))
+            hash_vbroadcasts.append(("vbroadcast", c1_v, c1_scalar))
             c3_scalar = self.scratch_const(val3)
             c3_v = self.alloc_scratch(f"hash_c3_v_{hi}", VLEN)
-            self.add("valu", ("vbroadcast", c3_v, c3_scalar))
+            hash_vbroadcasts.append(("vbroadcast", c3_v, c3_scalar))
             hash_c1_v.append(c1_v)
             hash_c3_v.append(c3_v)
             mul_v = None
@@ -199,8 +249,13 @@ class KernelBuilder:
                 mul = (1 + (1 << val3)) % (2**32)
                 mul_scalar = self.scratch_const(mul)
                 mul_v = self.alloc_scratch(f"hash_mul_v_{hi}", VLEN)
-                self.add("valu", ("vbroadcast", mul_v, mul_scalar))
+                hash_vbroadcasts.append(("vbroadcast", mul_v, mul_scalar))
             hash_mul_v.append(mul_v)
+
+        # Bundle hash vbroadcasts (6 per cycle)
+        for i in range(0, len(hash_vbroadcasts), 6):
+            chunk = hash_vbroadcasts[i:i+6]
+            self.instrs.append({"valu": chunk})
 
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting loop"))
@@ -209,7 +264,7 @@ class KernelBuilder:
         buffers = []
         vector_batch = (batch_size // VLEN) * VLEN
         vector_blocks = vector_batch // VLEN
-        pipe_buffers = min(18, vector_blocks) if vector_blocks else 0
+        pipe_buffers = min(10, vector_blocks) if vector_blocks else 0
         for bi in range(pipe_buffers):
             buffers.append({
                 "idx": self.alloc_scratch(f"idx_v{bi}", VLEN),
@@ -277,10 +332,10 @@ class KernelBuilder:
 
                 scheduled_this_cycle = set()
 
-                # Wrap threshold: only need bounds check after round 9 for n_nodes=2047
+                # Wrap threshold: only need bounds check when max idx can exceed n_nodes
                 # Max idx after round r is 2^(r+2) - 2
-                # After round 9: 2046 < 2047 (no wrap), after round 10: 4094 > 2047 (wrap)
-                wrap_threshold = 10
+                # wrap_threshold = smallest r where 2^(r+2) >= n_nodes + 2
+                wrap_threshold = (n_nodes + 1).bit_length() - 2
 
                 def next_round_phase(current_round):
                     """Determine next phase after completing a round."""

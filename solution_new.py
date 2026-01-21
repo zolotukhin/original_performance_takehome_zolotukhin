@@ -209,7 +209,7 @@ class KernelBuilder:
         buffers = []
         vector_batch = (batch_size // VLEN) * VLEN
         vector_blocks = vector_batch // VLEN
-        pipe_buffers = min(18, vector_blocks) if vector_blocks else 0
+        pipe_buffers = min(10, vector_blocks) if vector_blocks else 0
         for bi in range(pipe_buffers):
             buffers.append({
                 "idx": self.alloc_scratch(f"idx_v{bi}", VLEN),
@@ -387,9 +387,9 @@ class KernelBuilder:
                     elif phase == "update1":
                         valu_tasks.append((2, 2, block, "update1"))
                     elif phase == "hash_op2":
-                        valu_tasks.append((6, 1, block, "hash_op2"))
+                        valu_tasks.append((6, 1, block, "hash_op2"))  # was 3, now 6
                     elif phase == "hash_mul":
-                        valu_tasks.append((6, 1, block, "hash_mul"))
+                        valu_tasks.append((6, 1, block, "hash_mul"))  # was 4, now 6
                     elif phase == "hash_op1":
                         valu_tasks.append((5, 2, block, "hash_op1"))
                     elif phase == "xor":
@@ -429,8 +429,8 @@ class KernelBuilder:
                     elif phase == "round3_select7b":
                         valu_tasks.append((6, 1, block, "round3_select7b"))  # node
                     elif phase == "addr":
-                        # Higher priority (4) to feed gather pipeline
-                        valu_tasks.append((4, 1, block, "addr"))
+                        # Higher priority (3) to feed gather pipeline
+                        valu_tasks.append((3, 1, block, "addr"))
 
                 # Sort by priority (lower = higher priority)
                 valu_tasks.sort(key=lambda x: x[0])

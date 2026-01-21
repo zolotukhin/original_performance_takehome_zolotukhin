@@ -7,10 +7,29 @@
 
 ## Current Status
 - Baseline (frozen harness): 147734 cycles.
-- **solution_new.py: 1874 cycles** (78.83x speedup) - NEW BEST! Dynamic scheduler + rounds 0-3 selection + priority tuning
+- **perf_takehome.py: 1872 cycles** (78.92x speedup) - Dynamic scheduler + rounds 0-3 selection + priority tuning + 10 buffers
 - **solution.py: 2193 cycles** (67.37x speedup) - Hash fusion + reordering + _pack_overlap
-- **perf_takehome.py: 2076 cycles** (71.16x speedup) - Dynamic scheduler with 20 buffers
 - Target: <1363 cycles (still need ~1.37x improvement)
+
+### Fundamental Bottleneck Analysis (1872 cycles)
+- **Load ops**: 3219 (vload 64 + gather 3072 + setup 83)
+- **VALU ops**: 9580
+- **Theoretical load minimum**: 3219 / 2 = 1609.5 cycles
+- **Theoretical VALU minimum**: 9580 / 6 = 1596.7 cycles
+- **Actual**: 1872 cycles (16% overhead from dependencies and suboptimal scheduling)
+
+### Why <1363 cycles is very difficult
+- Theoretical load minimum (1609.5) is already ABOVE target (1363)
+- To reach 1363 at 2 loads/cycle, need max 2726 loads
+- Currently have 3219 loads → need to eliminate 493 loads (~2 rounds of gather)
+- Round 4 selection (16 values) failed due to scratch space constraints
+- Each additional selection level doubles complexity and scratch requirements
+
+### Slot Utilization
+- VALU: 85.2% utilized
+- LOAD: 85.9% utilized
+- Flow: 10.4% utilized (192 vselects for bounds checking in rounds 10-15)
+- 206 suboptimal cycles (11%) where neither slot type is saturated
 
 ### Recent Changes (Session)
 1. Ported dynamic scheduler from solution_new.py to perf_takehome.py → 2076 cycles
@@ -39,8 +58,16 @@
    - Changed hash_op2 priority from 3 to 6 (lower priority)
    - Delaying hash completion phases allows better VALU utilization
    - More blocks can progress through earlier phases in parallel
+8. **Buffer Count Optimization** (1874 → 1872 cycles, 2 cycles saved):
+   - Reduced buffer count from 17 to 10
+   - Fewer buffers = less contention = better scheduling
+   - 10 buffers is the sweet spot (8, 11, 12 all worse)
+9. **Round 4 Selection FAILED**:
+   - Attempted to extend selection to idx 15-30 (16 values)
+   - Not enough scratch registers per buffer for 4-level binary selection
+   - Would need to add extra temp registers (idx, val already in use)
 
-## Best Result: perf_takehome.py (2076 cycles, 71.16x speedup)
+## Best Result: solution_new.py (1872 cycles, 78.92x speedup)
 
 ### Algorithm Overview
 Dynamic scheduler with phase-based block processing. Each block processes 8 items (VLEN=8) through a pipeline of phases.
@@ -96,7 +123,8 @@ Final: store_both → store_idx → done
 - **Effect**: Reduces scheduling overhead and allows better parallelism
 
 ### Saved Diffs
-- `1874.py`: Current best (1874 cycles)
+- `1872.py`: Current best (1872 cycles, 10 buffers)
+- `1874.py`: Hash priority (1874 cycles, 17 buffers)
 - `1946.py`: Xor priority (1946 cycles)
 - `1972.py`: Addr priority (1972 cycles)
 - `1985.py`: Round 3 selection (1985 cycles)
@@ -747,7 +775,7 @@ To reach the opus45_casual threshold (< 1790 cycles), we would need:
 
 Current architecture is near local optimum for the given constraints.
 - `solution.py`: Alternative kernel with different structure (2320 cycles)
-- `2320_new.diff`: solution.py version (2320 cycles)
+- `2320.diff`: solution.py version (2320 cycles)
 - `2325.diff`: perf_takehome.py version (2325 cycles)
 - `2333.diff`: Previous checkpoint (2333 cycles)
 - `AGENT.md`: This file
