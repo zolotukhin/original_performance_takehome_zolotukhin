@@ -1,0 +1,381 @@
+diff --git a/perf_takehome.py b/perf_takehome.py
+index 4188190..f43ed4d 100644
+--- a/perf_takehome.py
++++ b/perf_takehome.py
+@@ -46,11 +46,12 @@ class KernelBuilder:
+         return DebugInfo(scratch_map=self.scratch_debug)
+ 
+     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+-        # Simple slot packing that just uses one slot per instruction bundle
+-        instrs = []
+-        for engine, slot in slots:
+-            instrs.append({engine: [slot]})
+-        return instrs
++        if not vliw:
++            instrs = []
++            for engine, slot in slots:
++                instrs.append({engine: [slot]})
++            return instrs
++        return self._pack_slots(slots)
+ 
+     def add(self, engine, slot):
+         self.instrs.append({engine: [slot]})
+@@ -64,10 +65,13 @@ class KernelBuilder:
+         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+         return addr
+ 
+-    def scratch_const(self, val, name=None):
++    def scratch_const(self, val, name=None, slots=None):
+         if val not in self.const_map:
+             addr = self.alloc_scratch(name)
+-            self.add("load", ("const", addr, val))
++            if slots is None:
++                self.add("load", ("const", addr, val))
++            else:
++                slots.append(("load", ("const", addr, val)))
+             self.const_map[val] = addr
+         return self.const_map[val]
+ 
+@@ -82,93 +86,263 @@ class KernelBuilder:
+ 
+         return slots
+ 
++    def build_vector_hash(self, val_hash_vec, tmp_vec1, tmp_vec2):
++        slots = []
++        const_addr = self.alloc_scratch("hash_consts", len(HASH_STAGES) * 2)
++        
++        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
++            self.add("load", ("const", const_addr + hi * 2, val1))
++            self.add("load", ("const", const_addr + hi * 2 + 1, val3))
++        
++        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
++            const1 = const_addr + hi * 2
++            const3 = const_addr + hi * 2 + 1
++            slots.append(("alu", ("vbroadcast", tmp_vec1, const1)))
++            slots.append(("alu", ("vbroadcast", tmp_vec2, const3)))
++            slots.append(("valu", (op1, tmp_vec1, val_hash_vec, tmp_vec1)))
++            slots.append(("valu", (op3, tmp_vec2, val_hash_vec, tmp_vec2)))
++            slots.append(("valu", (op2, val_hash_vec, tmp_vec1, tmp_vec2)))
++        
++        return slots
++
++    def _add_range(self, out, start, length):
++        for i in range(length):
++            out.add(start + i)
++
++    def _slot_rw(self, engine, slot):
++        reads = set()
++        writes = set()
++        if engine == "alu":
++            _op, dest, a1, a2 = slot
++            reads.update([a1, a2])
++            writes.add(dest)
++        elif engine == "valu":
++            match slot:
++                case ("vbroadcast", dest, src):
++                    reads.add(src)
++                    self._add_range(writes, dest, VLEN)
++                case ("multiply_add", dest, a, b, c):
++                    self._add_range(reads, a, VLEN)
++                    self._add_range(reads, b, VLEN)
++                    self._add_range(reads, c, VLEN)
++                    self._add_range(writes, dest, VLEN)
++                case (_op, dest, a1, a2):
++                    self._add_range(reads, a1, VLEN)
++                    self._add_range(reads, a2, VLEN)
++                    self._add_range(writes, dest, VLEN)
++        elif engine == "load":
++            match slot:
++                case ("load", dest, addr):
++                    reads.add(addr)
++                    writes.add(dest)
++                case ("load_offset", dest, addr, offset):
++                    reads.add(addr + offset)
++                    writes.add(dest + offset)
++                case ("vload", dest, addr):
++                    reads.add(addr)
++                    self._add_range(writes, dest, VLEN)
++                case ("const", dest, _val):
++                    writes.add(dest)
++        elif engine == "store":
++            match slot:
++                case ("store", addr, src):
++                    reads.update([addr, src])
++                case ("vstore", addr, src):
++                    reads.add(addr)
++                    self._add_range(reads, src, VLEN)
++        elif engine == "flow":
++            match slot:
++                case ("select", dest, cond, a, b):
++                    reads.update([cond, a, b])
++                    writes.add(dest)
++                case ("add_imm", dest, a, _imm):
++                    reads.add(a)
++                    writes.add(dest)
++                case ("vselect", dest, cond, a, b):
++                    self._add_range(reads, cond, VLEN)
++                    self._add_range(reads, a, VLEN)
++                    self._add_range(reads, b, VLEN)
++                    self._add_range(writes, dest, VLEN)
++                case ("cond_jump", cond, addr):
++                    reads.update([cond, addr])
++                case ("cond_jump_rel", cond, _offset):
++                    reads.add(cond)
++                case ("jump", addr):
++                    reads.add(addr)
++                case ("jump_indirect", addr):
++                    reads.add(addr)
++                case ("coreid", dest):
++                    writes.add(dest)
++                case ("trace_write", val):
++                    reads.add(val)
++        return reads, writes
++
++    def _pack_slots(self, slots: list[tuple[Engine, tuple]]):
++        instrs = []
++        bundle = {}
++        bundle_writes = set()
++        engine_counts = defaultdict(int)
++
++        def flush_bundle():
++            nonlocal bundle, bundle_writes, engine_counts
++            if bundle:
++                instrs.append(bundle)
++                bundle = {}
++                bundle_writes = set()
++                engine_counts = defaultdict(int)
++
++        for engine, slot in slots:
++            reads, writes = self._slot_rw(engine, slot)
++            if (
++                engine_counts[engine] >= SLOT_LIMITS[engine]
++                or reads & bundle_writes
++                or writes & bundle_writes
++            ):
++                flush_bundle()
++            bundle.setdefault(engine, []).append(slot)
++            engine_counts[engine] += 1
++            bundle_writes.update(writes)
++
++        flush_bundle()
++        return instrs
++
+     def build_kernel(
+         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+     ):
+         """
+-        Like reference_kernel2 but building actual instructions.
+-        Scalar implementation using only scalar ALU and load/store.
++        Optimized vectorized implementation using valu and vload/vstore.
+         """
++        slots = []
+         tmp1 = self.alloc_scratch("tmp1")
+         tmp2 = self.alloc_scratch("tmp2")
+         tmp3 = self.alloc_scratch("tmp3")
+-        # Scratch space addresses
+-        init_vars = [
+-            "rounds",
+-            "n_nodes",
+-            "batch_size",
+-            "forest_height",
+-            "forest_values_p",
+-            "inp_indices_p",
+-            "inp_values_p",
+-        ]
+-        for v in init_vars:
+-            self.alloc_scratch(v, 1)
+-        for i, v in enumerate(init_vars):
+-            self.add("load", ("const", tmp1, i))
+-            self.add("load", ("load", self.scratch[v], tmp1))
+-
+-        zero_const = self.scratch_const(0)
+-        one_const = self.scratch_const(1)
+-        two_const = self.scratch_const(2)
+-
+-        # Pause instructions are matched up with yield statements in the reference
+-        # kernel to let you debug at intermediate steps. The testing harness in this
+-        # file requires these match up to the reference kernel's yields, but the
+-        # submission harness ignores them.
+-        self.add("flow", ("pause",))
+-        # Any debug engine instruction is ignored by the submission simulator
+-        self.add("debug", ("comment", "Starting loop"))
+-
+-        body = []  # array of slots
+-
+-        # Scalar scratch registers
+-        tmp_idx = self.alloc_scratch("tmp_idx")
+-        tmp_val = self.alloc_scratch("tmp_val")
+-        tmp_node_val = self.alloc_scratch("tmp_node_val")
+-        tmp_addr = self.alloc_scratch("tmp_addr")
+-
+-        for round in range(rounds):
+-            for i in range(batch_size):
+-                i_const = self.scratch_const(i)
+-                # idx = mem[inp_indices_p + i]
+-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+-                body.append(("load", ("load", tmp_idx, tmp_addr)))
+-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+-                # val = mem[inp_values_p + i]
+-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+-                body.append(("load", ("load", tmp_val, tmp_addr)))
+-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+-                # node_val = mem[forest_values_p + idx]
+-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
+-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+-                # val = myhash(val ^ node_val)
+-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+-                # idx = 0 if idx >= n_nodes else idx
+-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+-                # mem[inp_indices_p + i] = idx
+-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+-                body.append(("store", ("store", tmp_addr, tmp_idx)))
+-                # mem[inp_values_p + i] = val
+-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+-                body.append(("store", ("store", tmp_addr, tmp_val)))
+-
+-        body_instrs = self.build(body)
+-        self.instrs.extend(body_instrs)
+-        # Required to match with the yield in reference_kernel2
+-        self.instrs.append({"flow": [("pause",)]})
++        tmp4 = self.alloc_scratch("tmp4")
++
++        zero_const = self.scratch_const(0, "zero", slots)
++        one_const = self.scratch_const(1, "one", slots)
++        two_const = self.scratch_const(2, "two", slots)
++        vlen_const = self.scratch_const(VLEN, "vlen", slots)
++        n_nodes_const = self.scratch_const(n_nodes, "n_nodes", slots)
++
++        forest_values_p = self.scratch_const(7, "forest_values_p", slots)
++        inp_indices_p = self.scratch_const(7 + n_nodes, "inp_indices_p", slots)
++        inp_values_p = self.scratch_const(
++            7 + n_nodes + batch_size, "inp_values_p", slots
++        )
++
++        idx_ptr = self.alloc_scratch("idx_ptr")
++        val_ptr = self.alloc_scratch("val_ptr")
++
++        idx_vec = self.alloc_scratch("idx_vec", VLEN)
++        val_vec = self.alloc_scratch("val_vec", VLEN)
++        node_val_vec = self.alloc_scratch("node_val_vec", VLEN)
++        addr_vec = self.alloc_scratch("addr_vec", VLEN)
++        tmp_vec1 = self.alloc_scratch("tmp_vec1", VLEN)
++        tmp_vec2 = self.alloc_scratch("tmp_vec2", VLEN)
++        cond_vec = self.alloc_scratch("cond_vec", VLEN)
++
++        forest_base_vec = self.alloc_scratch("forest_base_vec", VLEN)
++        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
++        one_vec = self.alloc_scratch("one_vec", VLEN)
++        two_vec = self.alloc_scratch("two_vec", VLEN)
++
++        slots.append(("valu", ("vbroadcast", forest_base_vec, forest_values_p)))
++        slots.append(("valu", ("vbroadcast", n_nodes_vec, n_nodes_const)))
++        slots.append(("valu", ("vbroadcast", one_vec, one_const)))
++        slots.append(("valu", ("vbroadcast", two_vec, two_const)))
++
++        hash_const_vecs = []
++        for op1, val1, op2, op3, val3 in HASH_STAGES:
++            const1 = self.scratch_const(val1, slots=slots)
++            const3 = self.scratch_const(val3, slots=slots)
++            const1_vec = self.alloc_scratch(length=VLEN)
++            const3_vec = self.alloc_scratch(length=VLEN)
++            slots.append(("valu", ("vbroadcast", const1_vec, const1)))
++            slots.append(("valu", ("vbroadcast", const3_vec, const3)))
++            hash_const_vecs.append((op1, op2, op3, const1_vec, const3_vec))
++
++        slots.append(("flow", ("pause",)))
++
++        # Process 2 vectors (16 items) at a time for better parallelism
++        full_blocks = batch_size // VLEN
++        two_vlen_const = self.scratch_const(VLEN * 2, "two_vlen", slots)
++
++        # Additional vector registers for second batch
++        idx_vec_b = self.alloc_scratch("idx_vec_b", VLEN)
++        val_vec_b = self.alloc_scratch("val_vec_b", VLEN)
++        node_val_vec_b = self.alloc_scratch("node_val_vec_b", VLEN)
++        addr_vec_b = self.alloc_scratch("addr_vec_b", VLEN)
++        tmp_vec1_b = self.alloc_scratch("tmp_vec1_b", VLEN)
++        tmp_vec2_b = self.alloc_scratch("tmp_vec2_b", VLEN)
++        cond_vec_b = self.alloc_scratch("cond_vec_b", VLEN)
++        idx_ptr_b = self.alloc_scratch("idx_ptr_b")
++        val_ptr_b = self.alloc_scratch("val_ptr_b")
++
++        for _round in range(rounds):
++            slots.append(("alu", ("+", idx_ptr, inp_indices_p, zero_const)))
++            slots.append(("alu", ("+", val_ptr, inp_values_p, zero_const)))
++
++            for _ in range(full_blocks // 2):
++                # Compute pointers for both batches A and B
++                slots.append(("alu", ("+", idx_ptr_b, idx_ptr, vlen_const)))
++                slots.append(("alu", ("+", val_ptr_b, val_ptr, vlen_const)))
++
++                # Load vectors A and B
++                slots.append(("load", ("vload", idx_vec, idx_ptr)))
++                slots.append(("load", ("vload", val_vec, val_ptr)))
++                slots.append(("load", ("vload", idx_vec_b, idx_ptr_b)))
++                slots.append(("load", ("vload", val_vec_b, val_ptr_b)))
++
++                # Compute gather addresses for A and B
++                slots.append(("valu", ("+", addr_vec, idx_vec, forest_base_vec)))
++                slots.append(("valu", ("+", addr_vec_b, idx_vec_b, forest_base_vec)))
++
++                # Gather loads for A and B (interleaved)
++                for vi in range(VLEN):
++                    slots.append(("load", ("load_offset", node_val_vec, addr_vec, vi)))
++                    slots.append(("load", ("load_offset", node_val_vec_b, addr_vec_b, vi)))
++
++                # XOR for A and B
++                slots.append(("valu", ("^", val_vec, val_vec, node_val_vec)))
++                slots.append(("valu", ("^", val_vec_b, val_vec_b, node_val_vec_b)))
++
++                # Hash for A and B in parallel
++                for op1, op2, op3, const1_vec, const3_vec in hash_const_vecs:
++                    slots.append(("valu", (op1, tmp_vec1, val_vec, const1_vec)))
++                    slots.append(("valu", (op3, tmp_vec2, val_vec, const3_vec)))
++                    slots.append(("valu", (op1, tmp_vec1_b, val_vec_b, const1_vec)))
++                    slots.append(("valu", (op3, tmp_vec2_b, val_vec_b, const3_vec)))
++                    slots.append(("valu", (op2, val_vec, tmp_vec1, tmp_vec2)))
++                    slots.append(("valu", (op2, val_vec_b, tmp_vec1_b, tmp_vec2_b)))
++
++                # Index calculation for A and B
++                slots.append(("valu", ("&", tmp_vec1, val_vec, one_vec)))
++                slots.append(("valu", ("&", tmp_vec1_b, val_vec_b, one_vec)))
++                slots.append(("valu", ("+", tmp_vec1, tmp_vec1, one_vec)))
++                slots.append(("valu", ("+", tmp_vec1_b, tmp_vec1_b, one_vec)))
++                slots.append(("valu", ("+", idx_vec, idx_vec, idx_vec)))  # idx * 2
++                slots.append(("valu", ("+", idx_vec_b, idx_vec_b, idx_vec_b)))
++                slots.append(("valu", ("+", idx_vec, idx_vec, tmp_vec1)))
++                slots.append(("valu", ("+", idx_vec_b, idx_vec_b, tmp_vec1_b)))
++
++                # Wrap index for A and B: idx = idx * (idx < n_nodes)
++                slots.append(("valu", ("<", cond_vec, idx_vec, n_nodes_vec)))
++                slots.append(("valu", ("<", cond_vec_b, idx_vec_b, n_nodes_vec)))
++                slots.append(("valu", ("*", idx_vec, idx_vec, cond_vec)))
++                slots.append(("valu", ("*", idx_vec_b, idx_vec_b, cond_vec_b)))
++
++                # Store results for A and B
++                slots.append(("store", ("vstore", idx_ptr, idx_vec)))
++                slots.append(("store", ("vstore", val_ptr, val_vec)))
++                slots.append(("store", ("vstore", idx_ptr_b, idx_vec_b)))
++                slots.append(("store", ("vstore", val_ptr_b, val_vec_b)))
++
++                # Advance pointers by 2*VLEN
++                slots.append(("alu", ("+", idx_ptr, idx_ptr, two_vlen_const)))
++                slots.append(("alu", ("+", val_ptr, val_ptr, two_vlen_const)))
++
++        slots.append(("flow", ("pause",)))
++        self.instrs = self.build(slots, vliw=True)
+ 
+ BASELINE = 147734
+ 

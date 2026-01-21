@@ -1,0 +1,1027 @@
+--- perf_takehome.py	2026-01-20 20:50:29
++++ solution.py	2026-01-20 20:55:58
+@@ -1,22 +1,7 @@
+-"""
+-# Anthropic's Original Performance Engineering Take-home (Release version)
+ 
+-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
+-to publish or redistribute your solutions so it's hard to find spoilers.
+-
+-# Task
+-
+-- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+-  available time, as measured by test_kernel_cycles on a frozen separate copy
+-  of the simulator.
+-
+-We recommend you look through problem.py next.
+-"""
+-
+ from collections import defaultdict
+ import random
+ import unittest
+-
+ from problem import (
+     Engine,
+     DebugInfo,
+@@ -33,7 +18,6 @@
+     reference_kernel2,
+ )
+ 
+-
+ class KernelBuilder:
+     def __init__(self):
+         self.instrs = []
+@@ -45,14 +29,6 @@
+     def debug_info(self):
+         return DebugInfo(scratch_map=self.scratch_debug)
+ 
+-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+-        if not vliw:
+-            instrs = []
+-            for engine, slot in slots:
+-                instrs.append({engine: [slot]})
+-            return instrs
+-        return self._pack_slots(slots)
+-
+     def add(self, engine, slot):
+         self.instrs.append({engine: [slot]})
+ 
+@@ -62,12 +38,12 @@
+             self.scratch[name] = addr
+             self.scratch_debug[addr] = (name, length)
+         self.scratch_ptr += length
+-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
++        assert self.scratch_ptr <= SCRATCH_SIZE, f"Out of scratch space: {self.scratch_ptr}"
+         return addr
+ 
+     def scratch_const(self, val, name=None, slots=None):
+         if val not in self.const_map:
+-            addr = self.alloc_scratch(name)
++            addr = self.alloc_scratch(f"c_{val}" if name is None else name)
+             if slots is None:
+                 self.add("load", ("const", addr, val))
+             else:
+@@ -75,40 +51,6 @@
+             self.const_map[val] = addr
+         return self.const_map[val]
+ 
+-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+-        slots = []
+-
+-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+-
+-        return slots
+-
+-    def build_vector_hash(self, val_hash_vec, tmp_vec1, tmp_vec2):
+-        slots = []
+-        const_addr = self.alloc_scratch("hash_consts", len(HASH_STAGES) * 2)
+-        
+-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+-            self.add("load", ("const", const_addr + hi * 2, val1))
+-            self.add("load", ("const", const_addr + hi * 2 + 1, val3))
+-        
+-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+-            const1 = const_addr + hi * 2
+-            const3 = const_addr + hi * 2 + 1
+-            slots.append(("alu", ("vbroadcast", tmp_vec1, const1)))
+-            slots.append(("alu", ("vbroadcast", tmp_vec2, const3)))
+-            slots.append(("valu", (op1, tmp_vec1, val_hash_vec, tmp_vec1)))
+-            slots.append(("valu", (op3, tmp_vec2, val_hash_vec, tmp_vec2)))
+-            slots.append(("valu", (op2, val_hash_vec, tmp_vec1, tmp_vec2)))
+-        
+-        return slots
+-
+-    def _add_range(self, out, start, length):
+-        for i in range(length):
+-            out.add(start + i)
+-
+     def _slot_rw(self, engine, slot):
+         reads = set()
+         writes = set()
+@@ -121,22 +63,22 @@
+                 _op, dest, a1 = slot
+                 reads.add(a1)
+                 writes.add(dest)
+-            else:
+-                pass
+         elif engine == "valu":
+             match slot:
+                 case ("vbroadcast", dest, src):
+                     reads.add(src)
+-                    self._add_range(writes, dest, VLEN)
++                    for i in range(VLEN): writes.add(dest + i)
+                 case ("multiply_add", dest, a, b, c):
+-                    self._add_range(reads, a, VLEN)
+-                    self._add_range(reads, b, VLEN)
+-                    self._add_range(reads, c, VLEN)
+-                    self._add_range(writes, dest, VLEN)
++                    for i in range(VLEN):
++                        reads.add(a + i)
++                        reads.add(b + i)
++                        reads.add(c + i)
++                        writes.add(dest + i)
+                 case (_op, dest, a1, a2):
+-                    self._add_range(reads, a1, VLEN)
+-                    self._add_range(reads, a2, VLEN)
+-                    self._add_range(writes, dest, VLEN)
++                    for i in range(VLEN):
++                        reads.add(a1 + i)
++                        reads.add(a2 + i)
++                        writes.add(dest + i)
+         elif engine == "load":
+             match slot:
+                 case ("load", dest, addr):
+@@ -147,7 +89,7 @@
+                     writes.add(dest + offset)
+                 case ("vload", dest, addr):
+                     reads.add(addr)
+-                    self._add_range(writes, dest, VLEN)
++                    for i in range(VLEN): writes.add(dest + i)
+                 case ("const", dest, _val):
+                     writes.add(dest)
+         elif engine == "store":
+@@ -156,7 +98,7 @@
+                     reads.update([addr, src])
+                 case ("vstore", addr, src):
+                     reads.add(addr)
+-                    self._add_range(reads, src, VLEN)
++                    for i in range(VLEN): reads.add(src + i)
+         elif engine == "flow":
+             match slot:
+                 case ("select", dest, cond, a, b):
+@@ -166,10 +108,11 @@
+                     reads.add(a)
+                     writes.add(dest)
+                 case ("vselect", dest, cond, a, b):
+-                    self._add_range(reads, cond, VLEN)
+-                    self._add_range(reads, a, VLEN)
+-                    self._add_range(reads, b, VLEN)
+-                    self._add_range(writes, dest, VLEN)
++                    for i in range(VLEN):
++                        reads.add(cond + i)
++                        reads.add(a + i)
++                        reads.add(b + i)
++                        writes.add(dest + i)
+                 case ("cond_jump", cond, addr):
+                     reads.update([cond, addr])
+                 case ("cond_jump_rel", cond, _offset):
+@@ -217,502 +160,266 @@
+         flush_bundle()
+         return instrs
+ 
+-    def build_kernel(
+-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+-    ):
+-        """
+-        Optimized kernel with inverted loop order: batch-outer, round-inner.
+-        This keeps data in registers across all 16 rounds per batch.
+-        """
++    def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
+         init_slots = []
+-        tmp1 = self.alloc_scratch("tmp1")
+-
+-        # Scalar constants
++        NVECS = 8 
++        
++        # Constants
+         zero_const = self.scratch_const(0, "zero", init_slots)
+         one_const = self.scratch_const(1, "one", init_slots)
+         vlen_const = self.scratch_const(VLEN, "vlen", init_slots)
+-        vlen4_const = self.scratch_const(VLEN * 4, "vlen4", init_slots)
++        vlen8_const = self.scratch_const(VLEN * NVECS, "vlen8", init_slots)
+         n_nodes_const = self.scratch_const(n_nodes, "n_nodes", init_slots)
+-
++        batch_end = self.scratch_const(batch_size, "batch_end", init_slots)
++        
+         forest_values_p = self.scratch_const(7, "forest_values_p", init_slots)
+         inp_indices_p = self.scratch_const(7 + n_nodes, "inp_indices_p", init_slots)
+         inp_values_p = self.scratch_const(7 + n_nodes + batch_size, "inp_values_p", init_slots)
+ 
+-        # Loop counters
+-        round_counter = self.alloc_scratch("round_counter")
+         batch_counter = self.alloc_scratch("batch_counter")
+-        max_rounds = self.scratch_const(rounds, "max_rounds", init_slots)
+-        batch_end = self.scratch_const(batch_size, "batch_end", init_slots)
+-
+-        # Pointers for 4 vectors
+-        idx_ptr0 = self.alloc_scratch("idx_ptr0")
+-        val_ptr0 = self.alloc_scratch("val_ptr0")
+-        idx_ptr1 = self.alloc_scratch("idx_ptr1")
+-        val_ptr1 = self.alloc_scratch("val_ptr1")
+-        idx_ptr2 = self.alloc_scratch("idx_ptr2")
+-        val_ptr2 = self.alloc_scratch("val_ptr2")
+-        idx_ptr3 = self.alloc_scratch("idx_ptr3")
+-        val_ptr3 = self.alloc_scratch("val_ptr3")
+-
+-        # Vector registers for 4 batches
+-        idx_vec0 = self.alloc_scratch("idx_vec0", VLEN)
+-        idx_vec1 = self.alloc_scratch("idx_vec1", VLEN)
+-        idx_vec2 = self.alloc_scratch("idx_vec2", VLEN)
+-        idx_vec3 = self.alloc_scratch("idx_vec3", VLEN)
+-        val_vec0 = self.alloc_scratch("val_vec0", VLEN)
+-        val_vec1 = self.alloc_scratch("val_vec1", VLEN)
+-        val_vec2 = self.alloc_scratch("val_vec2", VLEN)
+-        val_vec3 = self.alloc_scratch("val_vec3", VLEN)
+-        node_vec0 = self.alloc_scratch("node_vec0", VLEN)
+-        node_vec1 = self.alloc_scratch("node_vec1", VLEN)
+-        node_vec2 = self.alloc_scratch("node_vec2", VLEN)
+-        node_vec3 = self.alloc_scratch("node_vec3", VLEN)
+-        addr_vec0 = self.alloc_scratch("addr_vec0", VLEN)
+-        addr_vec1 = self.alloc_scratch("addr_vec1", VLEN)
+-        addr_vec2 = self.alloc_scratch("addr_vec2", VLEN)
+-        addr_vec3 = self.alloc_scratch("addr_vec3", VLEN)
+-        tmp_vec0 = self.alloc_scratch("tmp_vec0", VLEN)
+-        tmp_vec1 = self.alloc_scratch("tmp_vec1", VLEN)
+-        tmp_vec2 = self.alloc_scratch("tmp_vec2", VLEN)
+-        tmp_vec3 = self.alloc_scratch("tmp_vec3", VLEN)
+-        tmp2_vec0 = self.alloc_scratch("tmp2_vec0", VLEN)
+-        tmp2_vec1 = self.alloc_scratch("tmp2_vec1", VLEN)
+-        tmp2_vec2 = self.alloc_scratch("tmp2_vec2", VLEN)
+-        tmp2_vec3 = self.alloc_scratch("tmp2_vec3", VLEN)
+-        cond_vec0 = self.alloc_scratch("cond_vec0", VLEN)
+-        cond_vec1 = self.alloc_scratch("cond_vec1", VLEN)
+-        cond_vec2 = self.alloc_scratch("cond_vec2", VLEN)
+-        cond_vec3 = self.alloc_scratch("cond_vec3", VLEN)
+-
+-        # Constant vectors
+-        forest_base_vec = self.alloc_scratch("forest_base_vec", VLEN)
+-        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
++        
++        # Vectors
++        idx_vecs = [self.alloc_scratch(f"idx_vec{i}", VLEN) for i in range(NVECS)]
++        val_vecs = [self.alloc_scratch(f"val_vec{i}", VLEN) for i in range(NVECS)]
++        addr_vecs = [self.alloc_scratch(f"addr_vec{i}", VLEN) for i in range(NVECS)]
++        node_vecs = [self.alloc_scratch(f"node_vec{i}", VLEN) for i in range(NVECS)]
++        
++        # Hash Temps
++        temps_A = [self.alloc_scratch(f"ha_{i}", VLEN) for i in range(8)]
++        temps_B = [self.alloc_scratch(f"hb_{i}", VLEN) for i in range(8)]
++        
++        # Constants
+         one_vec = self.alloc_scratch("one_vec", VLEN)
+-
+-        init_slots.append(("valu", ("vbroadcast", forest_base_vec, forest_values_p)))
+-        init_slots.append(("valu", ("vbroadcast", n_nodes_vec, n_nodes_const)))
++        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
++        forest_base_vec = self.alloc_scratch("forest_base_vec", VLEN)
++        
+         init_slots.append(("valu", ("vbroadcast", one_vec, one_const)))
+-
+-        # Pre-broadcast hash constants
++        init_slots.append(("valu", ("vbroadcast", n_nodes_vec, n_nodes_const)))
++        init_slots.append(("valu", ("vbroadcast", forest_base_vec, forest_values_p)))
++        
++        # Hash Constants
+         hash_const_vecs = []
+         for op1, val1, op2, op3, val3 in HASH_STAGES:
+-            const1 = self.scratch_const(val1, slots=init_slots)
+-            const3 = self.scratch_const(val3, slots=init_slots)
+-            const1_vec = self.alloc_scratch(length=VLEN)
+-            const3_vec = self.alloc_scratch(length=VLEN)
+-            init_slots.append(("valu", ("vbroadcast", const1_vec, const1)))
+-            init_slots.append(("valu", ("vbroadcast", const3_vec, const3)))
+-            hash_const_vecs.append((op1, op2, op3, const1_vec, const3_vec))
+-
+-        init_slots.append(("flow", ("pause",)))
+-
+-        # Initialize round counter
+-        init_slots.append(("load", ("const", round_counter, 0)))
+-
+-        # Pack and add init instructions
++            c1 = self.scratch_const(val1, slots=init_slots)
++            c3 = self.scratch_const(val3, slots=init_slots)
++            v1 = self.alloc_scratch(length=VLEN)
++            v3 = self.alloc_scratch(length=VLEN)
++            init_slots.append(("valu", ("vbroadcast", v1, c1)))
++            init_slots.append(("valu", ("vbroadcast", v3, c3)))
++            hash_const_vecs.append((op1, op2, op3, v1, v3))
++        
+         self.instrs.extend(self._pack_slots(init_slots))
+-
+-        # NEW STRUCTURE: Batch-outer, Round-inner
+-        # This keeps data in registers for all 16 rounds
+-
+-        # Initialize pointers
+-        batch_setup = [
+-            ("alu", ("+", idx_ptr0, inp_indices_p, zero_const)),
+-            ("alu", ("+", val_ptr0, inp_values_p, zero_const)),
+-            ("load", ("const", batch_counter, 0)),
+-        ]
+-        self.instrs.extend(self._pack_slots(batch_setup))
+-
+-        # Batch loop start (outer loop)
+-        batch_loop_target = len(self.instrs)
++        self.add("load", ("const", batch_counter, 0))
++        
++        # BATCH LOOP
++        batch_loop_start = len(self.instrs)
++        
++        # Setup pointers
++        ptr_idx = self.alloc_scratch("ptr_idx")
++        ptr_val = self.alloc_scratch("ptr_val")
++        
++        load_setup = []
++        load_setup.append(("alu", ("+", ptr_idx, inp_indices_p, batch_counter)))
++        load_setup.append(("alu", ("+", ptr_val, inp_values_p, batch_counter)))
++        self.instrs.extend(self._pack_slots(load_setup))
++        
++        ptrs_i = [self.alloc_scratch() for _ in range(NVECS)]
++        ptrs_v = [self.alloc_scratch() for _ in range(NVECS)]
++        
++        setup_ptrs = []
++        setup_ptrs.append(("alu", ("+", ptrs_i[0], ptr_idx, zero_const)))
++        setup_ptrs.append(("alu", ("+", ptrs_v[0], ptr_val, zero_const)))
++        for i in range(1, NVECS):
++             setup_ptrs.append(("alu", ("+", ptrs_i[i], ptrs_i[i-1], vlen_const)))
++             setup_ptrs.append(("alu", ("+", ptrs_v[i], ptrs_v[i-1], vlen_const)))
++        self.instrs.extend(self._pack_slots(setup_ptrs))
++        
++        load_ops = []
++        for i in range(NVECS):
++            load_ops.append(("load", ("vload", idx_vecs[i], ptrs_i[i])))
++            load_ops.append(("load", ("vload", val_vecs[i], ptrs_v[i])))
++        self.instrs.extend(self._pack_slots(load_ops))
++        
++        # Logic Helpers (Same as before)
++        def gen_hash(vec_subset, hash_temps):
++            t0, t1, t2, t3, tt0, tt1, tt2, tt3 = hash_temps
++            ops = []
++            val_t_tt = zip(vec_subset, [t0, t1, t2, t3], [tt0, tt1, tt2, tt3])
++            val_t_tt_list = list(val_t_tt)
++            for op1, op2, op3, c1, c3 in hash_const_vecs:
++                 for (val, t, tt) in val_t_tt_list:
++                     ops.append(("valu", (op1, t, val, c1)))
++                     ops.append(("valu", (op3, tt, val, c3)))
++                 for (val, t, tt) in val_t_tt_list:
++                     ops.append(("valu", (op2, val, t, tt)))
++            return ops
++        
++        def gen_index_update(idx_subset, val_subset, hash_temps, node_nodes):
++            t0, t1, t2, t3, tt0, tt1, tt2, tt3 = hash_temps
++            ops = []
++            for i in range(4):
++                ops.append(("valu", ("&", [t0,t1,t2,t3][i], val_subset[i], one_vec)))
++            for i in range(4):
++                ops.append(("valu", ("+", [t0,t1,t2,t3][i], [t0,t1,t2,t3][i], one_vec)))
++            for i in range(4):
++                ops.append(("valu", ("+", idx_subset[i], idx_subset[i], idx_subset[i])))
++            for i in range(4):
++                ops.append(("valu", ("+", idx_subset[i], idx_subset[i], [t0,t1,t2,t3][i])))
++            for i in range(4):
++                ops.append(("valu", ("<", [tt0,tt1,tt2,tt3][i], idx_subset[i], node_nodes)))
++            for i in range(4):
++                ops.append(("valu", ("*", idx_subset[i], idx_subset[i], [tt0,tt1,tt2,tt3][i])))
++            return ops
+ 
+-        # Setup pointers for all 4 vectors (once per batch)
+-        ptr_setup = [
+-            ("alu", ("+", idx_ptr1, idx_ptr0, vlen_const)),
+-            ("alu", ("+", val_ptr1, val_ptr0, vlen_const)),
+-            ("alu", ("+", idx_ptr2, idx_ptr1, vlen_const)),
+-            ("alu", ("+", val_ptr2, val_ptr1, vlen_const)),
+-            ("alu", ("+", idx_ptr3, idx_ptr2, vlen_const)),
+-            ("alu", ("+", val_ptr3, val_ptr2, vlen_const)),
+-        ]
+-        self.instrs.extend(self._pack_slots(ptr_setup))
++        def gen_gather(idx_subset, addr_subset, node_subset):
++            ops = []
++            for i in range(4):
++                ops.append(("valu", ("+", addr_subset[i], idx_subset[i], forest_base_vec)))
++            for i in range(4):
++                dest = node_subset[i]
++                addr = addr_subset[i]
++                for vi in range(VLEN):
++                     ops.append(("load", ("load_offset", dest, addr, vi)))
++            return ops
++            
++        def gen_xor(val_subset, node_subset):
++             ops = []
++             for i in range(4):
++                 ops.append(("valu", ("^", val_subset[i], val_subset[i], node_subset[i])))
++             return ops
++             
++        def emit_pipelined_step(gatherA, hashA, gatherB, hashB):
++            ops = []
++            if gatherA: ops.extend(gen_gather(idx_vecs[:4], addr_vecs[:4], node_vecs[:4]))
++            if gatherB: ops.extend(gen_gather(idx_vecs[4:], addr_vecs[4:], node_vecs[4:]))
++            if hashA:
++                ops.extend(gen_xor(val_vecs[:4], node_vecs[:4]))
++                ops.extend(gen_hash(val_vecs[:4], temps_A))
++                ops.extend(gen_index_update(idx_vecs[:4], val_vecs[:4], temps_A, n_nodes_vec))
++            if hashB:
++                ops.extend(gen_xor(val_vecs[4:], node_vecs[4:]))
++                ops.extend(gen_hash(val_vecs[4:], temps_B))
++                ops.extend(gen_index_update(idx_vecs[4:], val_vecs[4:], temps_B, n_nodes_vec))
++            self.instrs.extend(self._pack_slots(ops))
+ 
+-        # Load all 4 vectors (once per batch)
+-        load_slots = [
+-            ("load", ("vload", idx_vec0, idx_ptr0)),
+-            ("load", ("vload", val_vec0, val_ptr0)),
+-            ("load", ("vload", idx_vec1, idx_ptr1)),
+-            ("load", ("vload", val_vec1, val_ptr1)),
+-            ("load", ("vload", idx_vec2, idx_ptr2)),
+-            ("load", ("vload", val_vec2, val_ptr2)),
+-            ("load", ("vload", idx_vec3, idx_ptr3)),
+-            ("load", ("vload", val_vec3, val_ptr3)),
+-            ("load", ("const", round_counter, 0)),
+-        ]
+-        self.instrs.extend(self._pack_slots(load_slots))
+-
+-        # === ROUND 0 SPECIAL CASE ===
+-        # All elements start with idx=0, so we can load tree[0] once and broadcast
+-        # instead of doing 32 gather loads per batch
+-        tree_node_0 = self.alloc_scratch("tree_node_0")
+-        round0_body = []
+-        # Load tree[0] - forest_values_p points to the tree base, tree[0] is at that address
+-        round0_body.append(("load", ("load", tree_node_0, forest_values_p)))
+-        # Broadcast to all node vectors
+-        round0_body.append(("valu", ("vbroadcast", node_vec0, tree_node_0)))
+-        round0_body.append(("valu", ("vbroadcast", node_vec1, tree_node_0)))
+-        round0_body.append(("valu", ("vbroadcast", node_vec2, tree_node_0)))
+-        round0_body.append(("valu", ("vbroadcast", node_vec3, tree_node_0)))
+-        # XOR
+-        round0_body.append(("valu", ("^", val_vec0, val_vec0, node_vec0)))
+-        round0_body.append(("valu", ("^", val_vec1, val_vec1, node_vec1)))
+-        round0_body.append(("valu", ("^", val_vec2, val_vec2, node_vec2)))
+-        round0_body.append(("valu", ("^", val_vec3, val_vec3, node_vec3)))
+-        # Hash computation
+-        for op1, op2, op3, const1_vec, const3_vec in hash_const_vecs:
+-            round0_body.append(("valu", (op1, tmp_vec0, val_vec0, const1_vec)))
+-            round0_body.append(("valu", (op3, tmp2_vec0, val_vec0, const3_vec)))
+-            round0_body.append(("valu", (op1, tmp_vec1, val_vec1, const1_vec)))
+-            round0_body.append(("valu", (op3, tmp2_vec1, val_vec1, const3_vec)))
+-            round0_body.append(("valu", (op1, tmp_vec2, val_vec2, const1_vec)))
+-            round0_body.append(("valu", (op3, tmp2_vec2, val_vec2, const3_vec)))
+-            round0_body.append(("valu", (op2, val_vec0, tmp_vec0, tmp2_vec0)))
+-            round0_body.append(("valu", (op2, val_vec1, tmp_vec1, tmp2_vec1)))
+-            round0_body.append(("valu", (op1, tmp_vec3, val_vec3, const1_vec)))
+-            round0_body.append(("valu", (op3, tmp2_vec3, val_vec3, const3_vec)))
+-            round0_body.append(("valu", (op2, val_vec2, tmp_vec2, tmp2_vec2)))
+-            round0_body.append(("valu", (op2, val_vec3, tmp_vec3, tmp2_vec3)))
+-        # Index calculation: idx = 2*idx + (val & 1) + 1
+-        # Since idx starts at 0: idx = 0*2 + (val & 1) + 1 = (val & 1) + 1
+-        round0_body.append(("valu", ("&", idx_vec0, val_vec0, one_vec)))
+-        round0_body.append(("valu", ("&", idx_vec1, val_vec1, one_vec)))
+-        round0_body.append(("valu", ("&", idx_vec2, val_vec2, one_vec)))
+-        round0_body.append(("valu", ("&", idx_vec3, val_vec3, one_vec)))
+-        round0_body.append(("valu", ("+", idx_vec0, idx_vec0, one_vec)))
+-        round0_body.append(("valu", ("+", idx_vec1, idx_vec1, one_vec)))
+-        round0_body.append(("valu", ("+", idx_vec2, idx_vec2, one_vec)))
+-        round0_body.append(("valu", ("+", idx_vec3, idx_vec3, one_vec)))
+-        # No wrap needed for round 0 since idx <= 2 and n_nodes is much larger
+-        self.instrs.extend(self._pack_slots(round0_body))
+-
+-        # === ROUND 1 SPECIAL CASE ===
+-        # After round 0, idx is either 1 or 2. Load tree[1] and tree[2], then vselect.
+-        tree_addr_tmp = self.alloc_scratch("tree_addr_tmp")
+-        tree_node_1 = self.alloc_scratch("tree_node_1")
+-        tree_node_2 = self.alloc_scratch("tree_node_2")
+-        tree_vec_1 = self.alloc_scratch("tree_vec_1", VLEN)
+-        tree_vec_2 = self.alloc_scratch("tree_vec_2", VLEN)
+-        two_const = self.alloc_scratch("two_const")
+-        round1_body = []
+-        # Load two_const, then load tree[1] and tree[2]
+-        round1_body.append(("load", ("const", two_const, 2)))
+-        round1_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, one_const)))
+-        round1_body.append(("load", ("load", tree_node_1, tree_addr_tmp)))
+-        round1_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, two_const)))
+-        round1_body.append(("load", ("load", tree_node_2, tree_addr_tmp)))
+-        # Broadcast to vectors
+-        round1_body.append(("valu", ("vbroadcast", tree_vec_1, tree_node_1)))
+-        round1_body.append(("valu", ("vbroadcast", tree_vec_2, tree_node_2)))
+-        # vselect based on idx: if idx == 2, use tree_vec_2, else tree_vec_1
+-        # cond = (idx == 2) ? 1 : 0
+-        two_vec = self.alloc_scratch("two_vec", VLEN)
+-        round1_body.append(("valu", ("vbroadcast", two_vec, two_const)))
+-        round1_body.append(("valu", ("==", cond_vec0, idx_vec0, two_vec)))
+-        round1_body.append(("valu", ("==", cond_vec1, idx_vec1, two_vec)))
+-        round1_body.append(("valu", ("==", cond_vec2, idx_vec2, two_vec)))
+-        round1_body.append(("valu", ("==", cond_vec3, idx_vec3, two_vec)))
+-        # vselect: node_vec = cond ? tree_vec_2 : tree_vec_1
+-        round1_body.append(("flow", ("vselect", node_vec0, cond_vec0, tree_vec_2, tree_vec_1)))
+-        round1_body.append(("flow", ("vselect", node_vec1, cond_vec1, tree_vec_2, tree_vec_1)))
+-        round1_body.append(("flow", ("vselect", node_vec2, cond_vec2, tree_vec_2, tree_vec_1)))
+-        round1_body.append(("flow", ("vselect", node_vec3, cond_vec3, tree_vec_2, tree_vec_1)))
+-        # XOR
+-        round1_body.append(("valu", ("^", val_vec0, val_vec0, node_vec0)))
+-        round1_body.append(("valu", ("^", val_vec1, val_vec1, node_vec1)))
+-        round1_body.append(("valu", ("^", val_vec2, val_vec2, node_vec2)))
+-        round1_body.append(("valu", ("^", val_vec3, val_vec3, node_vec3)))
+-        # Hash computation
+-        for op1, op2, op3, const1_vec, const3_vec in hash_const_vecs:
+-            round1_body.append(("valu", (op1, tmp_vec0, val_vec0, const1_vec)))
+-            round1_body.append(("valu", (op3, tmp2_vec0, val_vec0, const3_vec)))
+-            round1_body.append(("valu", (op1, tmp_vec1, val_vec1, const1_vec)))
+-            round1_body.append(("valu", (op3, tmp2_vec1, val_vec1, const3_vec)))
+-            round1_body.append(("valu", (op1, tmp_vec2, val_vec2, const1_vec)))
+-            round1_body.append(("valu", (op3, tmp2_vec2, val_vec2, const3_vec)))
+-            round1_body.append(("valu", (op2, val_vec0, tmp_vec0, tmp2_vec0)))
+-            round1_body.append(("valu", (op2, val_vec1, tmp_vec1, tmp2_vec1)))
+-            round1_body.append(("valu", (op1, tmp_vec3, val_vec3, const1_vec)))
+-            round1_body.append(("valu", (op3, tmp2_vec3, val_vec3, const3_vec)))
+-            round1_body.append(("valu", (op2, val_vec2, tmp_vec2, tmp2_vec2)))
+-            round1_body.append(("valu", (op2, val_vec3, tmp_vec3, tmp2_vec3)))
+-        # Index calculation: idx = 2*idx + (val & 1) + 1
+-        round1_body.append(("valu", ("&", tmp_vec0, val_vec0, one_vec)))
+-        round1_body.append(("valu", ("&", tmp_vec1, val_vec1, one_vec)))
+-        round1_body.append(("valu", ("&", tmp_vec2, val_vec2, one_vec)))
+-        round1_body.append(("valu", ("&", tmp_vec3, val_vec3, one_vec)))
+-        round1_body.append(("valu", ("+", tmp_vec0, tmp_vec0, one_vec)))
+-        round1_body.append(("valu", ("+", tmp_vec1, tmp_vec1, one_vec)))
+-        round1_body.append(("valu", ("+", tmp_vec2, tmp_vec2, one_vec)))
+-        round1_body.append(("valu", ("+", tmp_vec3, tmp_vec3, one_vec)))
+-        round1_body.append(("valu", ("+", idx_vec0, idx_vec0, idx_vec0)))
+-        round1_body.append(("valu", ("+", idx_vec1, idx_vec1, idx_vec1)))
+-        round1_body.append(("valu", ("+", idx_vec2, idx_vec2, idx_vec2)))
+-        round1_body.append(("valu", ("+", idx_vec3, idx_vec3, idx_vec3)))
+-        round1_body.append(("valu", ("+", idx_vec0, idx_vec0, tmp_vec0)))
+-        round1_body.append(("valu", ("+", idx_vec1, idx_vec1, tmp_vec1)))
+-        round1_body.append(("valu", ("+", idx_vec2, idx_vec2, tmp_vec2)))
+-        round1_body.append(("valu", ("+", idx_vec3, idx_vec3, tmp_vec3)))
+-        # No wrap needed for round 1 since idx <= 6 and n_nodes is much larger
+-        self.instrs.extend(self._pack_slots(round1_body))
+-
+-        # === ROUND 2 SPECIAL CASE ===
+-        # After round 1, idx is in {3, 4, 5, 6}. Use one-hot arithmetic selection.
+-        # node = (idx == 3) * tree[3] + (idx == 4) * tree[4] + (idx == 5) * tree[5] + (idx == 6) * tree[6]
+-        tree_node_3 = self.alloc_scratch("tree_node_3")
+-        tree_node_4 = self.alloc_scratch("tree_node_4")
+-        tree_node_5 = self.alloc_scratch("tree_node_5")
+-        tree_node_6 = self.alloc_scratch("tree_node_6")
+-        tree_vec_3 = self.alloc_scratch("tree_vec_3", VLEN)
+-        tree_vec_4 = self.alloc_scratch("tree_vec_4", VLEN)
+-        tree_vec_5 = self.alloc_scratch("tree_vec_5", VLEN)
+-        tree_vec_6 = self.alloc_scratch("tree_vec_6", VLEN)
+-        three_const = self.alloc_scratch("three_const")
+-        four_const = self.alloc_scratch("four_const")
+-        five_const = self.alloc_scratch("five_const")
+-        six_const = self.alloc_scratch("six_const")
+-        three_vec = self.alloc_scratch("three_vec", VLEN)
+-        four_vec = self.alloc_scratch("four_vec", VLEN)
+-        five_vec = self.alloc_scratch("five_vec", VLEN)
+-        six_vec = self.alloc_scratch("six_vec", VLEN)
+-        # Condition vectors for one-hot selection
+-        cond3_vec0 = self.alloc_scratch("cond3_vec0", VLEN)
+-        cond3_vec1 = self.alloc_scratch("cond3_vec1", VLEN)
+-        cond3_vec2 = self.alloc_scratch("cond3_vec2", VLEN)
+-        cond3_vec3 = self.alloc_scratch("cond3_vec3", VLEN)
+-        cond4_vec0 = self.alloc_scratch("cond4_vec0", VLEN)
+-        cond4_vec1 = self.alloc_scratch("cond4_vec1", VLEN)
+-        cond4_vec2 = self.alloc_scratch("cond4_vec2", VLEN)
+-        cond4_vec3 = self.alloc_scratch("cond4_vec3", VLEN)
+-        cond5_vec0 = self.alloc_scratch("cond5_vec0", VLEN)
+-        cond5_vec1 = self.alloc_scratch("cond5_vec1", VLEN)
+-        cond5_vec2 = self.alloc_scratch("cond5_vec2", VLEN)
+-        cond5_vec3 = self.alloc_scratch("cond5_vec3", VLEN)
+-        cond6_vec0 = self.alloc_scratch("cond6_vec0", VLEN)
+-        cond6_vec1 = self.alloc_scratch("cond6_vec1", VLEN)
+-        cond6_vec2 = self.alloc_scratch("cond6_vec2", VLEN)
+-        cond6_vec3 = self.alloc_scratch("cond6_vec3", VLEN)
+-
+-        round2_body = []
+-        # Load constants and tree nodes
+-        round2_body.append(("load", ("const", three_const, 3)))
+-        round2_body.append(("load", ("const", four_const, 4)))
+-        round2_body.append(("load", ("const", five_const, 5)))
+-        round2_body.append(("load", ("const", six_const, 6)))
+-        round2_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, three_const)))
+-        round2_body.append(("load", ("load", tree_node_3, tree_addr_tmp)))
+-        round2_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, four_const)))
+-        round2_body.append(("load", ("load", tree_node_4, tree_addr_tmp)))
+-        round2_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, five_const)))
+-        round2_body.append(("load", ("load", tree_node_5, tree_addr_tmp)))
+-        round2_body.append(("alu", ("+", tree_addr_tmp, forest_values_p, six_const)))
+-        round2_body.append(("load", ("load", tree_node_6, tree_addr_tmp)))
+-        # Broadcast tree nodes and constants to vectors
+-        round2_body.append(("valu", ("vbroadcast", tree_vec_3, tree_node_3)))
+-        round2_body.append(("valu", ("vbroadcast", tree_vec_4, tree_node_4)))
+-        round2_body.append(("valu", ("vbroadcast", tree_vec_5, tree_node_5)))
+-        round2_body.append(("valu", ("vbroadcast", tree_vec_6, tree_node_6)))
+-        round2_body.append(("valu", ("vbroadcast", three_vec, three_const)))
+-        round2_body.append(("valu", ("vbroadcast", four_vec, four_const)))
+-        round2_body.append(("valu", ("vbroadcast", five_vec, five_const)))
+-        round2_body.append(("valu", ("vbroadcast", six_vec, six_const)))
+-        # Compute one-hot conditions: (idx == 3), (idx == 4), (idx == 5), (idx == 6)
+-        round2_body.append(("valu", ("==", cond3_vec0, idx_vec0, three_vec)))
+-        round2_body.append(("valu", ("==", cond3_vec1, idx_vec1, three_vec)))
+-        round2_body.append(("valu", ("==", cond3_vec2, idx_vec2, three_vec)))
+-        round2_body.append(("valu", ("==", cond3_vec3, idx_vec3, three_vec)))
+-        round2_body.append(("valu", ("==", cond4_vec0, idx_vec0, four_vec)))
+-        round2_body.append(("valu", ("==", cond4_vec1, idx_vec1, four_vec)))
+-        round2_body.append(("valu", ("==", cond4_vec2, idx_vec2, four_vec)))
+-        round2_body.append(("valu", ("==", cond4_vec3, idx_vec3, four_vec)))
+-        round2_body.append(("valu", ("==", cond5_vec0, idx_vec0, five_vec)))
+-        round2_body.append(("valu", ("==", cond5_vec1, idx_vec1, five_vec)))
+-        round2_body.append(("valu", ("==", cond5_vec2, idx_vec2, five_vec)))
+-        round2_body.append(("valu", ("==", cond5_vec3, idx_vec3, five_vec)))
+-        round2_body.append(("valu", ("==", cond6_vec0, idx_vec0, six_vec)))
+-        round2_body.append(("valu", ("==", cond6_vec1, idx_vec1, six_vec)))
+-        round2_body.append(("valu", ("==", cond6_vec2, idx_vec2, six_vec)))
+-        round2_body.append(("valu", ("==", cond6_vec3, idx_vec3, six_vec)))
+-        # Multiply: cond * tree_value (compute partial products)
+-        round2_body.append(("valu", ("*", tmp_vec0, cond3_vec0, tree_vec_3)))
+-        round2_body.append(("valu", ("*", tmp_vec1, cond3_vec1, tree_vec_3)))
+-        round2_body.append(("valu", ("*", tmp_vec2, cond3_vec2, tree_vec_3)))
+-        round2_body.append(("valu", ("*", tmp_vec3, cond3_vec3, tree_vec_3)))
+-        round2_body.append(("valu", ("*", tmp2_vec0, cond4_vec0, tree_vec_4)))
+-        round2_body.append(("valu", ("*", tmp2_vec1, cond4_vec1, tree_vec_4)))
+-        round2_body.append(("valu", ("*", tmp2_vec2, cond4_vec2, tree_vec_4)))
+-        round2_body.append(("valu", ("*", tmp2_vec3, cond4_vec3, tree_vec_4)))
+-        # Sum partial products: node = sum of all cond * tree
+-        round2_body.append(("valu", ("+", node_vec0, tmp_vec0, tmp2_vec0)))
+-        round2_body.append(("valu", ("+", node_vec1, tmp_vec1, tmp2_vec1)))
+-        round2_body.append(("valu", ("+", node_vec2, tmp_vec2, tmp2_vec2)))
+-        round2_body.append(("valu", ("+", node_vec3, tmp_vec3, tmp2_vec3)))
+-        round2_body.append(("valu", ("*", tmp_vec0, cond5_vec0, tree_vec_5)))
+-        round2_body.append(("valu", ("*", tmp_vec1, cond5_vec1, tree_vec_5)))
+-        round2_body.append(("valu", ("*", tmp_vec2, cond5_vec2, tree_vec_5)))
+-        round2_body.append(("valu", ("*", tmp_vec3, cond5_vec3, tree_vec_5)))
+-        round2_body.append(("valu", ("+", node_vec0, node_vec0, tmp_vec0)))
+-        round2_body.append(("valu", ("+", node_vec1, node_vec1, tmp_vec1)))
+-        round2_body.append(("valu", ("+", node_vec2, node_vec2, tmp_vec2)))
+-        round2_body.append(("valu", ("+", node_vec3, node_vec3, tmp_vec3)))
+-        round2_body.append(("valu", ("*", tmp_vec0, cond6_vec0, tree_vec_6)))
+-        round2_body.append(("valu", ("*", tmp_vec1, cond6_vec1, tree_vec_6)))
+-        round2_body.append(("valu", ("*", tmp_vec2, cond6_vec2, tree_vec_6)))
+-        round2_body.append(("valu", ("*", tmp_vec3, cond6_vec3, tree_vec_6)))
+-        round2_body.append(("valu", ("+", node_vec0, node_vec0, tmp_vec0)))
+-        round2_body.append(("valu", ("+", node_vec1, node_vec1, tmp_vec1)))
+-        round2_body.append(("valu", ("+", node_vec2, node_vec2, tmp_vec2)))
+-        round2_body.append(("valu", ("+", node_vec3, node_vec3, tmp_vec3)))
+-        # XOR
+-        round2_body.append(("valu", ("^", val_vec0, val_vec0, node_vec0)))
+-        round2_body.append(("valu", ("^", val_vec1, val_vec1, node_vec1)))
+-        round2_body.append(("valu", ("^", val_vec2, val_vec2, node_vec2)))
+-        round2_body.append(("valu", ("^", val_vec3, val_vec3, node_vec3)))
+-        # Hash computation
+-        for op1, op2, op3, const1_vec, const3_vec in hash_const_vecs:
+-            round2_body.append(("valu", (op1, tmp_vec0, val_vec0, const1_vec)))
+-            round2_body.append(("valu", (op3, tmp2_vec0, val_vec0, const3_vec)))
+-            round2_body.append(("valu", (op1, tmp_vec1, val_vec1, const1_vec)))
+-            round2_body.append(("valu", (op3, tmp2_vec1, val_vec1, const3_vec)))
+-            round2_body.append(("valu", (op1, tmp_vec2, val_vec2, const1_vec)))
+-            round2_body.append(("valu", (op3, tmp2_vec2, val_vec2, const3_vec)))
+-            round2_body.append(("valu", (op2, val_vec0, tmp_vec0, tmp2_vec0)))
+-            round2_body.append(("valu", (op2, val_vec1, tmp_vec1, tmp2_vec1)))
+-            round2_body.append(("valu", (op1, tmp_vec3, val_vec3, const1_vec)))
+-            round2_body.append(("valu", (op3, tmp2_vec3, val_vec3, const3_vec)))
+-            round2_body.append(("valu", (op2, val_vec2, tmp_vec2, tmp2_vec2)))
+-            round2_body.append(("valu", (op2, val_vec3, tmp_vec3, tmp2_vec3)))
+-        # Index calculation: idx = 2*idx + (val & 1) + 1
+-        round2_body.append(("valu", ("&", tmp_vec0, val_vec0, one_vec)))
+-        round2_body.append(("valu", ("&", tmp_vec1, val_vec1, one_vec)))
+-        round2_body.append(("valu", ("&", tmp_vec2, val_vec2, one_vec)))
+-        round2_body.append(("valu", ("&", tmp_vec3, val_vec3, one_vec)))
+-        round2_body.append(("valu", ("+", tmp_vec0, tmp_vec0, one_vec)))
+-        round2_body.append(("valu", ("+", tmp_vec1, tmp_vec1, one_vec)))
+-        round2_body.append(("valu", ("+", tmp_vec2, tmp_vec2, one_vec)))
+-        round2_body.append(("valu", ("+", tmp_vec3, tmp_vec3, one_vec)))
+-        round2_body.append(("valu", ("+", idx_vec0, idx_vec0, idx_vec0)))
+-        round2_body.append(("valu", ("+", idx_vec1, idx_vec1, idx_vec1)))
+-        round2_body.append(("valu", ("+", idx_vec2, idx_vec2, idx_vec2)))
+-        round2_body.append(("valu", ("+", idx_vec3, idx_vec3, idx_vec3)))
+-        round2_body.append(("valu", ("+", idx_vec0, idx_vec0, tmp_vec0)))
+-        round2_body.append(("valu", ("+", idx_vec1, idx_vec1, tmp_vec1)))
+-        round2_body.append(("valu", ("+", idx_vec2, idx_vec2, tmp_vec2)))
+-        round2_body.append(("valu", ("+", idx_vec3, idx_vec3, tmp_vec3)))
+-        # No wrap needed for round 2 since idx <= 14 and n_nodes is much larger
+-        # Set round_counter = 3 for the remaining 13 rounds
+-        round2_body.append(("load", ("const", round_counter, 3)))
+-        self.instrs.extend(self._pack_slots(round2_body))
+-
+-        # Round loop start (inner loop) - for rounds 3-15
+-        round_loop_target = len(self.instrs)
+-
+-        # Build round body - compute and update in registers
+-        round_body = []
+-        # Compute gather addresses
+-        round_body.append(("valu", ("+", addr_vec0, idx_vec0, forest_base_vec)))
+-        round_body.append(("valu", ("+", addr_vec1, idx_vec1, forest_base_vec)))
+-        round_body.append(("valu", ("+", addr_vec2, idx_vec2, forest_base_vec)))
+-        round_body.append(("valu", ("+", addr_vec3, idx_vec3, forest_base_vec)))
+-
+-        # Gather loads (32 loads, 2 per cycle = 16 cycles)
+-        # Pipelined: interleave with hash to hide latency
+-        for vi in range(VLEN):
+-            round_body.append(("load", ("load_offset", node_vec0, addr_vec0, vi)))
+-            round_body.append(("load", ("load_offset", node_vec1, addr_vec1, vi)))
+-            round_body.append(("load", ("load_offset", node_vec2, addr_vec2, vi)))
+-            round_body.append(("load", ("load_offset", node_vec3, addr_vec3, vi)))
+-
+-        # XOR
+-        round_body.append(("valu", ("^", val_vec0, val_vec0, node_vec0)))
+-        round_body.append(("valu", ("^", val_vec1, val_vec1, node_vec1)))
+-        round_body.append(("valu", ("^", val_vec2, val_vec2, node_vec2)))
+-        round_body.append(("valu", ("^", val_vec3, val_vec3, node_vec3)))
+-
+-        # Hash computation
+-        for op1, op2, op3, const1_vec, const3_vec in hash_const_vecs:
+-            round_body.append(("valu", (op1, tmp_vec0, val_vec0, const1_vec)))
+-            round_body.append(("valu", (op3, tmp2_vec0, val_vec0, const3_vec)))
+-            round_body.append(("valu", (op1, tmp_vec1, val_vec1, const1_vec)))
+-            round_body.append(("valu", (op3, tmp2_vec1, val_vec1, const3_vec)))
+-            round_body.append(("valu", (op1, tmp_vec2, val_vec2, const1_vec)))
+-            round_body.append(("valu", (op3, tmp2_vec2, val_vec2, const3_vec)))
+-            round_body.append(("valu", (op2, val_vec0, tmp_vec0, tmp2_vec0)))
+-            round_body.append(("valu", (op2, val_vec1, tmp_vec1, tmp2_vec1)))
+-            round_body.append(("valu", (op1, tmp_vec3, val_vec3, const1_vec)))
+-            round_body.append(("valu", (op3, tmp2_vec3, val_vec3, const3_vec)))
+-            round_body.append(("valu", (op2, val_vec2, tmp_vec2, tmp2_vec2)))
+-            round_body.append(("valu", (op2, val_vec3, tmp_vec3, tmp2_vec3)))
+-
+-        # Index calculation: idx = 2*idx + (val & 1) + 1
+-        round_body.append(("valu", ("&", tmp_vec0, val_vec0, one_vec)))
+-        round_body.append(("valu", ("&", tmp_vec1, val_vec1, one_vec)))
+-        round_body.append(("valu", ("&", tmp_vec2, val_vec2, one_vec)))
+-        round_body.append(("valu", ("&", tmp_vec3, val_vec3, one_vec)))
+-        round_body.append(("valu", ("+", tmp_vec0, tmp_vec0, one_vec)))
+-        round_body.append(("valu", ("+", tmp_vec1, tmp_vec1, one_vec)))
+-        round_body.append(("valu", ("+", tmp_vec2, tmp_vec2, one_vec)))
+-        round_body.append(("valu", ("+", tmp_vec3, tmp_vec3, one_vec)))
+-        round_body.append(("valu", ("+", idx_vec0, idx_vec0, idx_vec0)))
+-        round_body.append(("valu", ("+", idx_vec1, idx_vec1, idx_vec1)))
+-        round_body.append(("valu", ("+", idx_vec2, idx_vec2, idx_vec2)))
+-        round_body.append(("valu", ("+", idx_vec3, idx_vec3, idx_vec3)))
+-        round_body.append(("valu", ("+", idx_vec0, idx_vec0, tmp_vec0)))
+-        round_body.append(("valu", ("+", idx_vec1, idx_vec1, tmp_vec1)))
+-        round_body.append(("valu", ("+", idx_vec2, idx_vec2, tmp_vec2)))
+-        round_body.append(("valu", ("+", idx_vec3, idx_vec3, tmp_vec3)))
+-
+-        # Wrap: idx = idx * (idx < n_nodes)
+-        round_body.append(("valu", ("<", cond_vec0, idx_vec0, n_nodes_vec)))
+-        round_body.append(("valu", ("<", cond_vec1, idx_vec1, n_nodes_vec)))
+-        round_body.append(("valu", ("<", cond_vec2, idx_vec2, n_nodes_vec)))
+-        round_body.append(("valu", ("<", cond_vec3, idx_vec3, n_nodes_vec)))
+-        round_body.append(("valu", ("*", idx_vec0, idx_vec0, cond_vec0)))
+-        round_body.append(("valu", ("*", idx_vec1, idx_vec1, cond_vec1)))
+-        round_body.append(("valu", ("*", idx_vec2, idx_vec2, cond_vec2)))
+-        round_body.append(("valu", ("*", idx_vec3, idx_vec3, cond_vec3)))
+-
+-        # (Loop control moved to beginning of round to overlap with gather)
+-
+-        # Pack and add round body
+-        self.instrs.extend(self._pack_slots(round_body))
+-
+-        # Round loop jump
+-        round_jump_src = len(self.instrs) + 1
+-        round_jump_offset = round_loop_target - round_jump_src
+-        self.add("flow", ("cond_jump_rel", tmp1, round_jump_offset))
++        # EXECUTE ROUNDS
++        
++        # --- Round 0 Optimization (Broadcast Root) ---
++        # Idx is always 0. Tree Node 0.
++        r0_node_scalar = self.alloc_scratch("r0_scalar")
++        r0_load = []
++        # Load tree[0]
++        r0_load.append(("load", ("load", r0_node_scalar, forest_values_p)))
++        self.instrs.extend(self._pack_slots(r0_load))
++        
++        # Broadcast and Process
++        r0_ops = []
++        for v in range(NVECS):
++            r0_ops.append(("valu", ("vbroadcast", node_vecs[v], r0_node_scalar)))
++        self.instrs.extend(self._pack_slots(r0_ops))
++        
++        # Compute R0
++        r0_comp = []
++        r0_comp.extend(gen_xor(val_vecs[:4], node_vecs[:4]))
++        r0_comp.extend(gen_xor(val_vecs[4:], node_vecs[4:]))
++        r0_comp.extend(gen_hash(val_vecs[:4], temps_A))
++        r0_comp.extend(gen_hash(val_vecs[4:], temps_B))
++        r0_comp.extend(gen_index_update(idx_vecs[:4], val_vecs[:4], temps_A, n_nodes_vec))
++        r0_comp.extend(gen_index_update(idx_vecs[4:], val_vecs[4:], temps_B, n_nodes_vec))
++        self.instrs.extend(self._pack_slots(r0_comp))
++        
++        # --- Round 1 Optimization (Select 1 or 2) ---
++        # Idx is 1 or 2. Load Tree[1], Tree[2].
++        r1_setup = []
++        node1_scalar = self.alloc_scratch("n1_s")
++        node2_scalar = self.alloc_scratch("n2_s")
++        tmp_ptr = self.alloc_scratch("tmp_ptr")
++        const_1 = self.scratch_const(1, slots=r1_setup)
++        const_2 = self.scratch_const(2, slots=r1_setup)
++        
++        # Load T1 (at base + 1)
++        r1_setup.append(("alu", ("+", tmp_ptr, forest_values_p, const_1)))
++        r1_setup.append(("load", ("load", node1_scalar, tmp_ptr)))
++        # Load T2 (at base + 2)
++        # Note: We can schedule separate ALU/Load if needed, packer handles it.
++        # But we need tmp_ptr update. 
++        # Pack splits if dependency.
++        self.instrs.extend(self._pack_slots(r1_setup))
++        
++        r1_load2 = []
++        r1_load2.append(("alu", ("+", tmp_ptr, forest_values_p, const_2)))
++        r1_load2.append(("load", ("load", node2_scalar, tmp_ptr)))
++        self.instrs.extend(self._pack_slots(r1_load2))
++        
++        # Select
++        r1_select = []
++        two_vec = self.alloc_scratch("two_vec", VLEN)
++        r1_select.append(("valu", ("vbroadcast", two_vec, const_2)))
++        self.instrs.extend(self._pack_slots(r1_select))
++        
++        r1_ops = []
++        # Reuse select_temps for broadcast vectors
++        # T1_vec = sel_0_0 (shared across vectors? No, need per-vector destination? No, T1_vec can be shared source for vselect)
++        # Actually vselect needs vector operands.
++        # We can allocate T1_vec, T2_vec once.
++        t1_vec = self.alloc_scratch("t1_vec", VLEN)
++        t2_vec = self.alloc_scratch("t2_vec", VLEN)
++        
++        r1_ops.append(("valu", ("vbroadcast", t1_vec, node1_scalar)))
++        r1_ops.append(("valu", ("vbroadcast", t2_vec, node2_scalar)))
++        self.instrs.extend(self._pack_slots(r1_ops))
++        
++        # Per vector select
++        # Need to allocate select_temps_sets
++        select_temps_sets = [[self.alloc_scratch(f"sel_cond_{v}_{i}") for i in range(1)] for v in range(NVECS)]
++        for v in range(NVECS):
++            sel_ops = []
++            cond = select_temps_sets[v][0]
++            sel_ops.append(("valu", ("==", cond, idx_vecs[v], two_vec)))
++            sel_ops.append(("flow", ("vselect", node_vecs[v], cond, t2_vec, t1_vec)))
++            self.instrs.extend(self._pack_slots(sel_ops))
++            
++        # Compute R1
++        r1_comp = []
++        r1_comp.extend(gen_xor(val_vecs[:4], node_vecs[:4]))
++        r1_comp.extend(gen_xor(val_vecs[4:], node_vecs[4:]))
++        r1_comp.extend(gen_hash(val_vecs[:4], temps_A))
++        r1_comp.extend(gen_hash(val_vecs[4:], temps_B))
++        r1_comp.extend(gen_index_update(idx_vecs[:4], val_vecs[:4], temps_A, n_nodes_vec))
++        r1_comp.extend(gen_index_update(idx_vecs[4:], val_vecs[4:], temps_B, n_nodes_vec))
++        self.instrs.extend(self._pack_slots(r1_comp))
+ 
+-        # Store results (once per batch, after all 16 rounds)
+-        store_slots = [
+-            ("store", ("vstore", idx_ptr0, idx_vec0)),
+-            ("store", ("vstore", val_ptr0, val_vec0)),
+-            ("store", ("vstore", idx_ptr1, idx_vec1)),
+-            ("store", ("vstore", val_ptr1, val_vec1)),
+-            ("store", ("vstore", idx_ptr2, idx_vec2)),
+-            ("store", ("vstore", val_ptr2, val_vec2)),
+-            ("store", ("vstore", idx_ptr3, idx_vec3)),
+-            ("store", ("vstore", val_ptr3, val_vec3)),
+-            ("alu", ("+", idx_ptr0, idx_ptr0, vlen4_const)),
+-            ("alu", ("+", val_ptr0, val_ptr0, vlen4_const)),
+-            ("alu", ("+", batch_counter, batch_counter, vlen4_const)),
+-            ("alu", ("<", tmp1, batch_counter, batch_end)),
+-        ]
+-        self.instrs.extend(self._pack_slots(store_slots))
+-
+-        # Batch loop jump
+-        batch_jump_src = len(self.instrs) + 1
+-        batch_jump_offset = batch_loop_target - batch_jump_src
+-        self.add("flow", ("cond_jump_rel", tmp1, batch_jump_offset))
+-
++        # --- Pipeline R2..15 ---
++        
++        # Prime R2: Gather A only.
++        emit_pipelined_step(gatherA=True, hashA=False, gatherB=False, hashB=False)
++        
++        # Loop R2..
++        for r in range(2, rounds):
++            # Step 1: Hash A(r) | Gather B(r)
++            emit_pipelined_step(gatherA=False, hashA=True, gatherB=True, hashB=False)
++            
++            # Step 2: Gather A(r+1) | Hash B(r)
++            next_gather = (r + 1 < rounds)
++            emit_pipelined_step(gatherA=next_gather, hashA=False, gatherB=False, hashB=True)
++             
++        # Store
++        store_ops = []
++        for i in range(NVECS):
++             store_ops.append(("store", ("vstore", ptrs_i[i], idx_vecs[i])))
++             store_ops.append(("store", ("vstore", ptrs_v[i], val_vecs[i])))
++        self.instrs.extend(self._pack_slots(store_ops))
++        
++        # Jump
++        jump_slots = []
++        jump_slots.append(("alu", ("+", batch_counter, batch_counter, vlen8_const)))
++        cond = self.alloc_scratch()
++        jump_slots.append(("alu", ("<", cond, batch_counter, batch_end)))
++        self.instrs.extend(self._pack_slots(jump_slots))
++        
++        jump_src = len(self.instrs) + 1
++        offset = batch_loop_start - jump_src
++        self.add("flow", ("cond_jump_rel", cond, offset))
+         self.add("flow", ("pause",))
+ 
+ BASELINE = 147734
+@@ -730,88 +437,42 @@
+     forest = Tree.generate(forest_height)
+     inp = Input.generate(forest, batch_size, rounds)
+     mem = build_mem_image(forest, inp)
++    mem_for_machine = list(mem)
++    
++    ref_gen = reference_kernel2(mem, {})
++    next(ref_gen) 
++    ref_final = next(ref_gen)
+ 
+     kb = KernelBuilder()
+     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+-    # print(kb.instrs)
+ 
+-    value_trace = {}
+     machine = Machine(
+-        mem,
++        mem_for_machine,
+         kb.instrs,
+         kb.debug_info(),
+         n_cores=N_CORES,
+-        value_trace=value_trace,
+         trace=trace,
+     )
+     machine.prints = prints
+-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+-        machine.run()
+-        inp_values_p = ref_mem[6]
+-        if prints:
+-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+-        assert (
+-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+-        ), f"Incorrect result on round {i}"
+-        inp_indices_p = ref_mem[5]
+-        if prints:
+-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+-        # Updating these in memory isn't required, but you can enable this check for debugging
+-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
++    machine.run()
++    
++    for _ in ref_gen: pass
++    
++    inp_values_p = ref_final[6]
++    inp_indices_p = ref_final[5]
++    
++    m_vals = machine.mem[inp_values_p : inp_values_p + len(inp.values)]
++    r_vals = ref_final[inp_values_p : inp_values_p + len(inp.values)]
++    
++    assert m_vals == r_vals, "Incorrect result values"
++    
++    ind_m = machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
++    ind_r = ref_final[inp_indices_p : inp_indices_p + len(inp.indices)]
++    assert ind_m == ind_r, "Incorrect result indices"
+ 
+     print("CYCLES: ", machine.cycle)
+     print("Speedup over baseline: ", BASELINE / machine.cycle)
+     return machine.cycle
+ 
+-
+-class Tests(unittest.TestCase):
+-    def test_ref_kernels(self):
+-        """
+-        Test the reference kernels against each other
+-        """
+-        random.seed(123)
+-        for i in range(10):
+-            f = Tree.generate(4)
+-            inp = Input.generate(f, 10, 6)
+-            mem = build_mem_image(f, inp)
+-            reference_kernel(f, inp)
+-            for _ in reference_kernel2(mem, {}):
+-                pass
+-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
+-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
+-
+-    def test_kernel_trace(self):
+-        # Full-scale example for performance testing
+-        do_kernel_test(10, 16, 256, trace=True, prints=False)
+-
+-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
+-    # You can uncomment this if you think it might help you debug
+-    # def test_kernel_correctness(self):
+-    #     for batch in range(1, 3):
+-    #         for forest_height in range(3):
+-    #             do_kernel_test(
+-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
+-    #             )
+-
+-    def test_kernel_cycles(self):
+-        do_kernel_test(10, 16, 256)
+-
+-
+-# To run all the tests:
+-#    python perf_takehome.py
+-# To run a specific test:
+-#    python perf_takehome.py Tests.test_kernel_cycles
+-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
+-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
+-#    python perf_takehome.py Tests.test_kernel_trace
+-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
+-# You can then keep that open and re-run the test to see a new trace.
+-
+-# To run the proper checks to see which thresholds you pass:
+-#    python tests/submission_tests.py
+-
+ if __name__ == "__main__":
+-    unittest.main()
++    do_kernel_test(10, 16, 256)
