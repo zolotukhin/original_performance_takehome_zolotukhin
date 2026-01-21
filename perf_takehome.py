@@ -596,7 +596,7 @@ class KernelBuilder:
                     elif phase == "hash_op2":
                         valu_tasks.append((5, 1, block, "hash_op2"))
                     elif phase == "hash_mul":
-                        valu_tasks.append((3, 1, block, "hash_mul"))
+                        valu_tasks.append((7, 1, block, "hash_mul"))
                     elif phase == "hash_op1":
                         valu_tasks.append((5, 1, block, "hash_op1"))
                     elif phase == "xor":
@@ -671,6 +671,16 @@ class KernelBuilder:
                         else:
                             block["next_phase"] = "update3"
                     elif phase == "update1":
+                        # Offload AND to scalar ALU when slots available (like hash_op1)
+                        if alu_slots >= VLEN and valu_slots >= 1:
+                            for lane in range(VLEN):
+                                alu_ops.append(("&", buf["tmp1"] + lane, buf["val"] + lane, one_const))
+                            valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
+                            alu_slots -= VLEN
+                            valu_slots -= 1
+                            block["next_phase"] = "update2"
+                            scheduled_this_cycle.add(block["block"])
+                            continue
                         valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
                         valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
                         block["next_phase"] = "update2"
@@ -711,7 +721,6 @@ class KernelBuilder:
                         block["next_phase"] = "round2_select2"
                     elif phase == "round2_select2":
                         # Compute sel1 = offset >> 1
-                        # Try to also do low/high computations if we have slots (they don't depend on cond yet)
                         valu_ops.append((">>", buf["cond"], buf["tmp2"], one_v))  # sel1
                         block["next_phase"] = "round2_select3"
                     elif phase == "round2_select3":

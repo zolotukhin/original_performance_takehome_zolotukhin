@@ -7,17 +7,37 @@
 
 ## Current Status
 - Baseline (frozen harness): 147734 cycles.
-- **perf_takehome.py: 1470 cycles** (100.50x speedup) - Dynamic scheduler with init bundling + early interleaving
+- **perf_takehome.py: 1468 cycles** (100.64x speedup) - Dynamic scheduler with init bundling + early interleaving + ALU offload
 - Target: <1363 cycles (108.4x speedup) - likely impossible due to load bottleneck
 
-### Recent Progress (1474 → 1470 cycles, 4 cycles saved)
-- Moved block offset allocation earlier to enable early interleaving
+### Recent Progress (1474 → 1468 cycles, 6 cycles saved)
+- Moved block offset allocation earlier to enable early interleaving (3 cycles)
 - Interleaved 6 block offset const loads with 3 VALU-only cycles:
   - First 6 vbroadcasts + 2 block offset loads (cycle 1)
   - tree3-6 ALU + diff_1_2 vbroadcasts + 2 block offset loads (cycle 2)
   - tree5,6 vbroadcasts + diff_3_4 + 2 block offset loads (cycle 3)
 - Remaining 5 block offset loads interleaved with hash vbroadcasts
 - Combined last ALU cycle with pause instruction (1 cycle saved)
+- Offloaded AND in update1 phase to scalar ALU (2 cycles saved)
+  - Uses 8 scalar ALU ops instead of 1 VALU op when slots available
+  - Frees VALU slot for other work
+
+### Optimization Analysis (1468 cycles)
+- **Total loads**: 2675 → minimum 1337.5 cycles (load-bound)
+- **Total VALU**: 7910 → minimum 1318.3 cycles
+- **Current**: 1468 cycles (9.8% overhead above load minimum)
+- **Gap to target**: 105 cycles (1468 - 1363)
+
+**Overhead breakdown:**
+- Init phase: 28 cycles (2 cycles above 26-cycle minimum)
+- Body selection phases: ~43 cycles with load=0 (VALU saturated)
+- Drain phase: ~60 cycles with reduced parallelism
+- Store overlap: 62/64 cycles overlapped (optimal)
+
+**Why further improvement is very difficult:**
+- Selection phases (rounds 0-2, 11-13) are VALU-bound - can't add loads
+- Drain phase has inherently reduced parallelism (fewer active buffers)
+- All major scheduling optimizations have been applied
 
 ### Previous Progress (1823 → 1782 cycles, 41 cycles saved)
 - Bundled init_vars[6] with tree0_scalar load (1 cycle)
@@ -120,10 +140,11 @@ Final: store_both → store_idx → done
 ```
 
 ## Files
-- `solution_new.py` - Current optimized kernel (1473 cycles)
-- `perf_takehome.py` - Original baseline
-- `1473.diff` - Diff from baseline to current solution (1473 cycles)
-- `1474.diff` - Previous version (1474 cycles)
+- `perf_takehome.py` - Current optimized kernel (1468 cycles)
+- `1468.diff` - Diff from 1474.py to current solution (1468 cycles)
+- `1470.diff` - Previous version (1470 cycles)
+- `1474.py` - Base version (1474 cycles)
+- `solution_new.py` - Alternative optimized kernel (1473 cycles)
 
 ## Potential Further Optimizations
 
