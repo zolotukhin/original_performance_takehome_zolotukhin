@@ -313,11 +313,12 @@ class KernelBuilder:
         block_offset_loads.append((sixteen_const, 16))
         block_offset_loads.append((twentyfour_const, 24))
 
-        # Phase 3: Interleave vbroadcasts with block offset loads
+        # Phase 3: Interleave vbroadcasts with block offset loads, then ALU ops
         # We have 12 vbroadcasts (6 c1 + 6 c3) and 3 mul broadcasts = 15 valu ops
         # Plus 11 block offset const loads (base offsets + 8/16/24 constants)
+        # Plus 24 ALU ops for offset computation (8 bases * 3 ops each)
 
-        # Strategy: pair const loads with vbroadcasts (2 loads + up to 6 valu per cycle)
+        # Build all broadcasts
         all_broadcasts = []
         for i in range(len(HASH_STAGES)):
             all_broadcasts.append(("vbroadcast", hash_c1_v[i], c1_scalars[i]))
@@ -327,7 +328,15 @@ class KernelBuilder:
             if hash_mul_v[hi] is not None:
                 all_broadcasts.append(("vbroadcast", hash_mul_v[hi], mul_scalars[hi][1]))
 
-        # Pack: 2 const loads + 6 vbroadcasts per cycle while we have both
+        # Build all offset ALU ops upfront
+        all_alu_ops = []
+        for base_idx in base_indices:
+            base_addr = block_off_addrs[base_idx]
+            all_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
+            all_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
+            all_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
+
+        # Phase 3a: Pack vbroadcasts + const loads (loads must complete before ALU)
         bc_idx = 0
         const_idx = 0
         while bc_idx < len(all_broadcasts) or const_idx < len(block_offset_loads):
@@ -353,21 +362,20 @@ class KernelBuilder:
             if bundle:
                 self.add_packed(bundle)
 
-        # Compute remaining block offsets using ALU adds from the base offsets.
-        offset_alu_ops = []
-        for base_idx in base_indices:
-            base_addr = block_off_addrs[base_idx]
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
-            offset_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
-            if len(offset_alu_ops) == SLOT_LIMITS["alu"]:
-                self.add_packed({"alu": offset_alu_ops})
-                offset_alu_ops = []
-        if offset_alu_ops:
-            self.add_packed({"alu": offset_alu_ops})
-
-        # Add pause after all init
-        self.add_packed({"flow": [("pause",)]})
+        # Phase 3b: Now emit ALU ops (constants are loaded, results available)
+        # Pack up to 12 ALU ops per cycle, combine last cycle with pause
+        alu_idx = 0
+        while alu_idx < len(all_alu_ops):
+            alu_ops_bundle = []
+            while len(alu_ops_bundle) < SLOT_LIMITS["alu"] and alu_idx < len(all_alu_ops):
+                alu_ops_bundle.append(all_alu_ops[alu_idx])
+                alu_idx += 1
+            if alu_ops_bundle:
+                # Combine last ALU cycle with pause to save 1 cycle
+                if alu_idx >= len(all_alu_ops):
+                    self.add_packed({"alu": alu_ops_bundle, "flow": [("pause",)]})
+                else:
+                    self.add_packed({"alu": alu_ops_bundle})
         body_instrs = []
 
         buffers = []
