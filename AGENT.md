@@ -7,31 +7,119 @@
 
 ## Current Status
 - Baseline (frozen harness): 147734 cycles.
-- **solution.py: 1458 cycles** (101.33x speedup) - Dynamic scheduler with block 0 early start
-- **perf_takehome.py: 1460 cycles** (101.19x speedup) - Previous best
-- Target: <1363 cycles (108.4x speedup) - **mathematically impossible** due to fundamental load bottleneck
+- **perf_takehome.py: 1457 cycles** (101.40x speedup) - Current best
+- Target: <1363 cycles (108.4x speedup) - **mathematically challenging** due to fundamental load bottleneck
 
-### Recent Optimization (1459 → 1458 cycles, 1 cycle saved)
+### Latest Session: 1458 → 1457 cycles (1 cycle saved)
+
+**Key Optimizations Applied:**
+1. **Share block_off_addrs[0] with zero_const**: Block 0 offset = 0, so reuse zero_const instead of allocating a separate scratch address.
+2. **Add 8, 16, 24 to const_map early**: This allows hash constants to deduplicate (hash_c3_s_5 = 16 can reuse sixteen_const).
+3. **Reorder early_block_loads**: Load 8, 16, 24 first so they're available earlier for ALU ops that compute derived offsets.
+4. **pending_offset_ops approach**: Dynamically enqueue ALU ops during broadcast phase when dependencies become ready, spreading ALU work across cycles.
+5. **Pack pause with last init bundle**: Instead of adding pause on its own cycle (wasting 1 cycle), pack it with the last broadcast/ALU bundle.
+
+**Diff saved to**: `1457.diff`
+
+**Remaining gap to target**: 1457 - 1363 = 94 cycles
+
+### Latest Session Findings (Continued Exploration)
+
+**Optimizations Tested:**
+1. **Phase combining (round2_select 5→3 phases)**: WORSE (1474 cycles). Larger phases reduce inter-block parallelism.
+2. **Buffer count sweep (6-15)**: 13 buffers remains optimal. Fewer = more stalls, more = synchronized VALU phases.
+3. **Block start staggering**: No effect. Blocks still synchronize in phases regardless of start timing.
+4. **Selection depth changes (gather for depth 2)**: MUCH WORSE (1732 cycles). Selection saves significant loads.
+
+**Zero-Load Cycle Analysis:**
+- **Total zero-load cycles**: 122 (out of 1458)
+- **Main bubble (cycles 41-73)**: 33 cycles where all 13 active blocks are in VALU phases
+- **Wind-down (cycles 1367+)**: ~50 cycles during pipeline drain
+- **Root cause**: All blocks progress through phases synchronously, creating VALU-only "waves"
+
+**Resource Utilization:**
+- **VALU**: 89.9% utilized (7862 ops, 5.4/cycle average)
+- **Load**: 91.7% utilized (2673 ops, 1.8/cycle average)
+- **ALU**: 53.6% utilized (9382 ops, 6.4/cycle average) - spare capacity used for hash offloading
+
+**To reach <1363 cycles would require:**
+- Load-bound minimum: 1337 cycles (2673 loads / 2)
+- Max zero-load overhead allowed: 25 cycles
+- Current zero-load overhead: 122 cycles
+- **Need to eliminate 97 zero-load cycles** - fundamentally limited by algorithm structure
+
+**Conclusion**: The current 1458 cycles is near-optimal for the given algorithm. Reaching <1363 would require:
+1. Implementing depth-3 selection (complex, ~500 load reduction but uncertain VALU tradeoff)
+2. Block-level pipeline diversity (major scheduler restructuring)
+3. Algorithmic changes to reduce total operations
+
+### Detailed Overhead Analysis (Latest)
+- **Init**: 28 cycles (27 instructions + pause)
+- **Body**: 1431 cycles
+  - **2-load cycles**: 1312 (load-bound minimum, perfect utilization)
+  - **0-load cycles**: 119 (all overhead is here)
+  - **1-load cycles**: 0
+- **Total overhead**: 119 cycles from pipeline ramp-up (~35) and wind-down (~84)
+
+To achieve <1363 cycles would require:
+- Target body: 1363 - 28 = 1335 cycles max
+- Max overhead: 1335 - 1312 = 23 cycles
+- Current overhead: 117 cycles (27 ramp-up + 9 scattered + 81 wind-down)
+- **Would need to eliminate 94 zero-load cycles** - not feasible with current algorithm
+
+### Detailed Zero-Load Cycle Analysis
+- **Ramp-up (cycles 1-40)**: 27 zero-load cycles
+  - Pipeline filling period, blocks haven't reached gather phase yet
+  - VALU utilization is still high (6 ops/cycle) during these cycles
+- **Steady-state (cycles 41-1300)**: 9 zero-load cycles
+  - Near-perfect load utilization (2.00 loads/cycle)
+  - Only 9 scattered zero-load cycles (0.7% overhead)
+- **Wind-down (cycles 1301+)**: 81 zero-load cycles
+  - Pipeline draining, blocks finishing their final rounds
+  - Last full-load cycle at body cycle 1417
+  - Only 14 cycles after that (final hash/update/store phases)
+
+### Latest Optimization Attempt: Round 3 Selection (FAILED)
+- **Goal**: Eliminate 256 gather loads (128 cycles) by using preloaded tree[7-14] with selection
+- **Implementation**:
+  - Added tree7-14 loading during init (const loads + memory loads + broadcasts + diffs)
+  - Added 12 VALU phases (round3_select1-10 + round3_select8b) for 3-level binary selection
+  - sel0 = parity (from previous update1), sel1 = (offset>>1)&1, sel2 = offset>>2
+- **Result**: 1600 cycles (141 cycles WORSE than 1469 without tree loading)
+- **Root cause**:
+  - Init overhead: +11 cycles (tree7-14 loading)
+  - Selection overhead: 12 VALU phases per round 3 > 8 gather cycles (4 cycles at 2 loads/cycle)
+  - RAW hazard in round3_select8 required splitting into two phases
+- **Bug found**: Initial implementation had RAW hazard where const loads and ALU ops using those consts were in the same cycle (seven_const used before loaded)
+- **Conclusion**: Round 3 selection is fundamentally more expensive than gather due to VALU overhead
+
+### Previous Optimization (1459 → 1458 cycles, 1 cycle saved)
 - Block 0 early start: Skip init_addr phase for block 0 (offset=0, so idx_addr=inp_indices_p directly)
 - Store direct addresses in block dict, check in vload/vstore scheduling
 - Saved 1 cycle by eliminating init_addr for first block
+- **Note**: Lost 1 cycle during round3_select cleanup, now at 1459 cycles
 
-### Previous Optimization (1460 → 1459 cycles, 1 cycle saved)
-- Interleaved early ALU ops (using eight_const and sixteen_const) into cycle 25
-- Combined remaining ALU ops (using twentyfour_const) with late ALU into single cycle
-- Reduced init phase from 28 cycles to 27 cycles
+### Latest Optimization Attempts (Current Session)
+- **Block 0 early start**: Skip init_addr for block 0 since offset=0. Saved 1 cycle (1459→1458).
+- **Round2_select consolidation (5→3 phases)**: Tried combining phases A(3 ops), B(2 ops), C(1 op). Made things WORSE (1496 cycles) because larger phases reduce inter-block parallelism.
+- **Buffer address precomputation**: Precompute addresses for blocks 1-12 during init. Made things WORSE (1461 cycles) because init_addr uses idle ALU slots that overlap with load-bound body work.
+- **Priority tuning**: Tested addr priority 1-8. Current priority 5 is optimal. Higher/lower priorities both hurt performance.
+- **Buffer count analysis**: Tested 6-15 buffers. 13 remains optimal (tested again for confirmation).
+- **Optimized round 3 selection analysis**: Even with 6 VALU phases (minimum possible), still worse than 4-cycle gather because VALU is 94% utilized.
 
-### Optimizations Attempted but Ineffective (1459 → 1459 cycles)
+### Optimizations Attempted but Ineffective (Previous Sessions)
+- **Round 3 selection (depth 3)**: Preload tree[7-14], use 3-level binary selection instead of 8 gathers. Made things 141 cycles WORSE (1600 vs 1459). 12 VALU phases > 4 gather cycles.
 - **Scalar ALU offloading during zero-load cycles**: Tried offloading hash_op2, round2_select1, round2_select2 to scalar ALU when VALU slots == 0. Condition rarely triggered; no improvement.
 - **Round2_select phase combining**: Tried reducing from 5 phases to 3 by combining independent ops. Made performance worse (1474 cycles) because 3-op phases were harder to schedule.
 - **Different buffer counts**: Tested 10-15 buffers. 13 remains optimal.
+- **Precomputing all block addresses**: init_addr uses 2 ALU slots per block. Found that all init_addr cycles have 2 loads (full utilization) - ALU ops happen in parallel with load-bound work, so no savings possible.
+- **Moving block 0's vload to init phase (with pause)**: Made things worse (1479 cycles). Creates a 0-load cycle in body because blocks 1-12 still need init_addr before their vload.
 
 ### Comprehensive Analysis (1459 cycles)
 
 **Cycle Breakdown:**
-- Init phase: 27 cycles (was 28, optimized by interleaving ALU)
+- Init phase: 28 cycles
 - Body phase: 1431 cycles (minimum 1312 - load-bound with 2624 load ops)
-- Final pause: 1 cycle
 - **Total**: 1459 cycles
 
 **Body Phase Analysis:**
@@ -168,8 +256,11 @@ Final: store_both → store_idx → done
 ```
 
 ## Files
-- `solution.py` - Current optimized kernel (1459 cycles)
-- `perf_takehome.py` - Previous optimized kernel (1460 cycles)
+- `perf_takehome.py` - Current optimized kernel (1457 cycles)
+- `1457_stable.py` - Backup of 1457 cycle solution
+- `1457.diff` - Diff from 1458_stable.py to 1457 cycles (pending_offset_ops + pause packing)
+- `1458_stable.py` - Previous version (1458 cycles)
+- `solution.py` - Alternative optimized kernel (1459 cycles)
 - `1459.diff` - Diff from perf_takehome.py to solution.py (1459 cycles)
 - `1460.diff` - Diff from 1474.py to perf_takehome.py (1460 cycles)
 - `1468.diff` - Previous version (1468 cycles)

@@ -121,15 +121,57 @@ class KernelBuilder:
         two_v = self.alloc_scratch("two_v", VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
         forest_base_v = self.alloc_scratch("forest_base_v", VLEN)
-        # OPTIMIZED: Pack 6 vbroadcasts into 1 cycle (tree0_v added since tree0_scalar already loaded)
-        self.add_packed({"valu": [
+
+        # EARLY SETUP: Allocate block offset addresses for interleaving
+        vector_batch_early = (batch_size // VLEN) * VLEN
+        block_offset_values_early = list(range(0, vector_batch_early, VLEN))  # 0, 8, 16, ..., 248
+        block_off_addrs = []
+        for i, off in enumerate(block_offset_values_early):
+            if off == 0:
+                # Share with zero_const for block 0 offset
+                addr = zero_const
+            else:
+                addr = self.alloc_scratch(f"block_off_{i}")
+            block_off_addrs.append(addr)
+
+        # Load only base offsets (every 4th); compute the rest with ALU adds
+        base_indices = list(range(0, len(block_offset_values_early), 4))  # 0, 4, 8, 12, 16, 20, 24, 28
+        eight_const = self.alloc_scratch("eight_const")
+        sixteen_const = self.alloc_scratch("sixteen_const")
+        twentyfour_const = self.alloc_scratch("twentyfour_const")
+        # Add to const_map so hash constants can reuse if they match
+        self.const_map[8] = eight_const
+        self.const_map[16] = sixteen_const
+        self.const_map[24] = twentyfour_const
+
+        # Build early block offset loads list - load 8,16,24 FIRST so they're available for ALU
+        early_block_loads = [
+            (eight_const, 8),
+            (sixteen_const, 16),
+            (twentyfour_const, 24),
+        ]
+        # Then base offsets (skip block 0 which is zero_const, already loaded)
+        for i in base_indices:
+            if block_off_addrs[i] != zero_const:
+                early_block_loads.append((block_off_addrs[i], block_offset_values_early[i]))
+        early_load_idx = 0
+
+        # OPTIMIZED: Pack 6 vbroadcasts WITH 2 early block offset loads
+        vb_bundle = {"valu": [
             ("vbroadcast", zero_v, zero_const),
             ("vbroadcast", one_v, one_const),
             ("vbroadcast", two_v, two_const),
             ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]),
             ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]),
             ("vbroadcast", tree0_v, tree0_scalar),
-        ]})
+        ]}
+        if early_load_idx + 1 < len(early_block_loads):
+            vb_bundle["load"] = [
+                ("const", early_block_loads[early_load_idx][0], early_block_loads[early_load_idx][1]),
+                ("const", early_block_loads[early_load_idx+1][0], early_block_loads[early_load_idx+1][1]),
+            ]
+            early_load_idx += 2
+        self.add_packed(vb_bundle)
 
         # Preload tree[1], tree[2] for round 1 optimization (idx in {1,2} after round 0)
         tree1_scalar = self.alloc_scratch("tree1_scalar")
@@ -181,8 +223,8 @@ class KernelBuilder:
         diff_3_4_v = self.alloc_scratch("diff_3_4_v", VLEN)  # tree4 - tree3
         diff_5_6_v = self.alloc_scratch("diff_5_6_v", VLEN)  # tree6 - tree5
 
-        # OPTIMIZED: Pack diff_1_2/three_v with tree3-6 ALU ops (saves 1 cycle)
-        self.add_packed({
+        # OPTIMIZED: Pack diff_1_2/three_v with tree3-6 ALU ops AND 2 early block offset loads
+        tree_alu_bundle = {
             "valu": [
                 ("-", diff_1_2_v, tree2_v, tree1_v),
                 ("vbroadcast", three_v, three_const),
@@ -193,7 +235,14 @@ class KernelBuilder:
                 ("+", tree5_scalar, self.scratch["forest_values_p"], five_const),
                 ("+", tree6_scalar, self.scratch["forest_values_p"], six_const),
             ],
-        })
+        }
+        if early_load_idx + 1 < len(early_block_loads):
+            tree_alu_bundle["load"] = [
+                ("const", early_block_loads[early_load_idx][0], early_block_loads[early_load_idx][1]),
+                ("const", early_block_loads[early_load_idx+1][0], early_block_loads[early_load_idx+1][1]),
+            ]
+            early_load_idx += 2
+        self.add_packed(tree_alu_bundle)
         # OPTIMIZED: Pack loads 2 per cycle
         # OPTIMIZED: Overlap loads with broadcasts - load tree3,4, then load tree5,6 with broadcast tree3,4
         self.add_packed({"load": [
@@ -210,12 +259,19 @@ class KernelBuilder:
                 ("vbroadcast", tree4_v, tree4_scalar),
             ],
         })
-        # Broadcast tree5,6 and compute diff_3_4 (all VALU)
-        self.add_packed({"valu": [
+        # Broadcast tree5,6 and compute diff_3_4 (all VALU) WITH 2 early block offset loads
+        tree56_bundle = {"valu": [
             ("vbroadcast", tree5_v, tree5_scalar),
             ("vbroadcast", tree6_v, tree6_scalar),
             ("-", diff_3_4_v, tree4_v, tree3_v),
-        ]})
+        ]}
+        if early_load_idx + 1 < len(early_block_loads):
+            tree56_bundle["load"] = [
+                ("const", early_block_loads[early_load_idx][0], early_block_loads[early_load_idx][1]),
+                ("const", early_block_loads[early_load_idx+1][0], early_block_loads[early_load_idx+1][1]),
+            ]
+            early_load_idx += 2
+        self.add_packed(tree56_bundle)
         # diff_5_6 will be deferred to combine with first hash const load below
         deferred_diff_5_6 = ("-", diff_5_6_v, tree6_v, tree5_v)
 
@@ -287,38 +343,12 @@ class KernelBuilder:
             else:
                 hash_mul_v.append(None)
 
-        # Setup for block offset loading
-        vector_batch_temp = (batch_size // VLEN) * VLEN
-        block_offset_values = list(range(0, vector_batch_temp, VLEN))  # 0, 8, 16, ..., 248
+        # Phase 3: Interleave vbroadcasts with REMAINING block offset loads using pending_offset_ops
+        # Some block offset loads already done in early interleaving above
+        # Build remaining loads list from early_load_idx onwards
+        remaining_block_loads = early_block_loads[early_load_idx:]
 
-        # Allocate all block offset addresses upfront
-        block_off_addrs = []
-        for i in range(len(block_offset_values)):
-            addr = self.alloc_scratch(f"block_off_{i}")
-            self.const_map[block_offset_values[i]] = addr
-            block_off_addrs.append(addr)
-
-        # Load only base offsets (every 4th); compute the rest with ALU adds.
-        base_indices = list(range(0, len(block_offset_values), 4))
-        block_offset_loads = [
-            (block_off_addrs[i], block_offset_values[i]) for i in base_indices
-        ]
-        eight_const = self.alloc_scratch("eight_const")
-        sixteen_const = self.alloc_scratch("sixteen_const")
-        twentyfour_const = self.alloc_scratch("twentyfour_const")
-        self.const_map[8] = eight_const
-        self.const_map[16] = sixteen_const
-        self.const_map[24] = twentyfour_const
-        block_offset_loads.append((eight_const, 8))
-        block_offset_loads.append((sixteen_const, 16))
-        block_offset_loads.append((twentyfour_const, 24))
-
-        # Phase 3: Interleave vbroadcasts with block offset loads, then ALU ops
-        # We have 12 vbroadcasts (6 c1 + 6 c3) and 3 mul broadcasts = 15 valu ops
-        # Plus 11 block offset const loads (base offsets + 8/16/24 constants)
-        # Plus 24 ALU ops for offset computation (8 bases * 3 ops each)
-
-        # Build all broadcasts
+        # Collect all hash vbroadcasts
         all_broadcasts = []
         for i in range(len(HASH_STAGES)):
             all_broadcasts.append(("vbroadcast", hash_c1_v[i], c1_scalars[i]))
@@ -328,18 +358,35 @@ class KernelBuilder:
             if hash_mul_v[hi] is not None:
                 all_broadcasts.append(("vbroadcast", hash_mul_v[hi], mul_scalars[hi][1]))
 
-        # Build all offset ALU ops upfront
-        all_alu_ops = []
+        # Build sets for tracking dependencies
+        base_addr_set = set()
+        base_targets = {}
         for base_idx in base_indices:
             base_addr = block_off_addrs[base_idx]
-            all_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
-            all_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
-            all_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
+            base_addr_set.add(base_addr)
+            base_targets[base_addr] = (
+                block_off_addrs[base_idx + 1],
+                block_off_addrs[base_idx + 2],
+                block_off_addrs[base_idx + 3],
+            )
+        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
 
-        # Phase 3a: Pack vbroadcasts + const loads (loads must complete before ALU)
+        # Track which addresses were loaded in early phase
+        early_loaded_base_addrs = {addr for addr, _ in early_block_loads[:early_load_idx] if addr in base_addr_set}
+        early_loaded_const_addrs = {addr for addr, _ in early_block_loads[:early_load_idx] if addr in const_addr_set}
+
+        # Use pending_offset_ops to dynamically enqueue ALU ops when dependencies are ready
+        pending_offset_ops = []
+        loaded_base_addrs = set(early_loaded_base_addrs)
+        # zero_const is already loaded (it's one of the first constants)
+        if block_off_addrs[0] == zero_const:
+            loaded_base_addrs.add(zero_const)
+        enqueued_base_addrs = set()
+        loaded_const_addrs = set(early_loaded_const_addrs)
+
         bc_idx = 0
         const_idx = 0
-        while bc_idx < len(all_broadcasts) or const_idx < len(block_offset_loads):
+        while bc_idx < len(all_broadcasts) or const_idx < len(remaining_block_loads) or pending_offset_ops:
             bundle = {}
 
             # Add up to 6 vbroadcasts
@@ -350,32 +397,52 @@ class KernelBuilder:
             if valu_ops:
                 bundle["valu"] = valu_ops
 
-            # Add up to 2 const loads
+            # Add up to 2 const loads from remaining
             load_ops = []
-            while len(load_ops) < 2 and const_idx < len(block_offset_loads):
-                addr, val = block_offset_loads[const_idx]
+            loaded_bases_this_cycle = []
+            loaded_consts_this_cycle = []
+            while len(load_ops) < 2 and const_idx < len(remaining_block_loads):
+                addr, val = remaining_block_loads[const_idx]
                 load_ops.append(("const", addr, val))
+                if addr in base_addr_set:
+                    loaded_bases_this_cycle.append(addr)
+                elif addr in const_addr_set:
+                    loaded_consts_this_cycle.append(addr)
                 const_idx += 1
             if load_ops:
                 bundle["load"] = load_ops
 
+            # Add up to 12 ALU ops from pending queue
+            alu_ops = []
+            while pending_offset_ops and len(alu_ops) < SLOT_LIMITS["alu"]:
+                alu_ops.append(pending_offset_ops.pop(0))
+            if alu_ops:
+                bundle["alu"] = alu_ops
+
+            # Check if this is the last iteration
+            is_last = not (bc_idx < len(all_broadcasts) or const_idx < len(remaining_block_loads) or pending_offset_ops)
+
             if bundle:
+                # Add pause to the last bundle (saves 1 cycle vs separate pause)
+                if is_last:
+                    bundle["flow"] = [("pause",)]
                 self.add_packed(bundle)
 
-        # Phase 3b: Now emit ALU ops (constants are loaded, results available)
-        # Pack up to 12 ALU ops per cycle, combine last cycle with pause
-        alu_idx = 0
-        while alu_idx < len(all_alu_ops):
-            alu_ops_bundle = []
-            while len(alu_ops_bundle) < SLOT_LIMITS["alu"] and alu_idx < len(all_alu_ops):
-                alu_ops_bundle.append(all_alu_ops[alu_idx])
-                alu_idx += 1
-            if alu_ops_bundle:
-                # Combine last ALU cycle with pause to save 1 cycle
-                if alu_idx >= len(all_alu_ops):
-                    self.add_packed({"alu": alu_ops_bundle, "flow": [("pause",)]})
-                else:
-                    self.add_packed({"alu": alu_ops_bundle})
+            # Update loaded sets and enqueue new ALU ops when deps are ready
+            loaded_base_addrs.update(loaded_bases_this_cycle)
+            loaded_const_addrs.update(loaded_consts_this_cycle)
+            constants_ready = len(loaded_const_addrs) == len(const_addr_set)
+            if constants_ready:
+                for base_addr in loaded_base_addrs:
+                    if base_addr in enqueued_base_addrs:
+                        continue
+                    t1, t2, t3 = base_targets[base_addr]
+                    pending_offset_ops.extend([
+                        ("+", t1, base_addr, eight_const),
+                        ("+", t2, base_addr, sixteen_const),
+                        ("+", t3, base_addr, twentyfour_const),
+                    ])
+                    enqueued_base_addrs.add(base_addr)
         body_instrs = []
 
         buffers = []
@@ -416,16 +483,32 @@ class KernelBuilder:
                 if next_block >= vector_blocks or not free_bufs:
                     return False
                 buf_idx = free_bufs.pop(0)
-                active.append({
-                    "block": next_block,
-                    "buf_idx": buf_idx,
-                    "buf": buffers[buf_idx],
-                    "offset": block_offsets[next_block],
-                    "phase": "init_addr",
-                    "round": 0,
-                    "stage": 0,
-                    "gather": 0,
-                })
+                buf = buffers[buf_idx]
+                # Block 0 optimization: offset is 0, so use base pointers directly
+                if next_block == 0:
+                    active.append({
+                        "block": next_block,
+                        "buf_idx": buf_idx,
+                        "buf": buf,
+                        "offset": block_offsets[next_block],
+                        "phase": "vload",  # Skip init_addr
+                        "round": 0,
+                        "stage": 0,
+                        "gather": 0,
+                        "direct_idx_addr": self.scratch["inp_indices_p"],
+                        "direct_val_addr": self.scratch["inp_values_p"],
+                    })
+                else:
+                    active.append({
+                        "block": next_block,
+                        "buf_idx": buf_idx,
+                        "buf": buf,
+                        "offset": block_offsets[next_block],
+                        "phase": "init_addr",
+                        "round": 0,
+                        "stage": 0,
+                        "gather": 0,
+                    })
                 next_block += 1
                 return True
 
@@ -508,7 +591,8 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_both" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        store_ops.append(("vstore", buf["val_addr"], buf["val"]))
+                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+                        store_ops.append(("vstore", val_addr, buf["val"]))
                         block["next_phase"] = "store_idx"
                         scheduled_this_cycle.add(block["block"])
                         store_slots -= 1
@@ -518,7 +602,8 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_idx" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        store_ops.append(("vstore", buf["idx_addr"], buf["idx"]))
+                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+                        store_ops.append(("vstore", idx_addr, buf["idx"]))
                         block["next_phase"] = "done"
                         scheduled_this_cycle.add(block["block"])
                         store_slots -= 1
@@ -529,8 +614,10 @@ class KernelBuilder:
                         break
                     if block["phase"] == "vload" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        load_ops.append(("vload", buf["idx"], buf["idx_addr"]))
-                        load_ops.append(("vload", buf["val"], buf["val_addr"]))
+                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+                        load_ops.append(("vload", buf["idx"], idx_addr))
+                        load_ops.append(("vload", buf["val"], val_addr))
                         # For round 0, skip addr and gather phases (all idx=0, use tree0_v)
                         if block["round"] == 0:
                             block["next_phase"] = "round0_xor"
@@ -580,7 +667,7 @@ class KernelBuilder:
                     elif phase == "hash_op2":
                         valu_tasks.append((5, 1, block, "hash_op2"))
                     elif phase == "hash_mul":
-                        valu_tasks.append((3, 1, block, "hash_mul"))
+                        valu_tasks.append((7, 1, block, "hash_mul"))
                     elif phase == "hash_op1":
                         valu_tasks.append((5, 1, block, "hash_op1"))
                     elif phase == "xor":
@@ -655,6 +742,16 @@ class KernelBuilder:
                         else:
                             block["next_phase"] = "update3"
                     elif phase == "update1":
+                        # Offload AND to scalar ALU when slots available (like hash_op1)
+                        if alu_slots >= VLEN and valu_slots >= 1:
+                            for lane in range(VLEN):
+                                alu_ops.append(("&", buf["tmp1"] + lane, buf["val"] + lane, one_const))
+                            valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
+                            alu_slots -= VLEN
+                            valu_slots -= 1
+                            block["next_phase"] = "update2"
+                            scheduled_this_cycle.add(block["block"])
+                            continue
                         valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
                         valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
                         block["next_phase"] = "update2"
@@ -695,7 +792,6 @@ class KernelBuilder:
                         block["next_phase"] = "round2_select2"
                     elif phase == "round2_select2":
                         # Compute sel1 = offset >> 1
-                        # Try to also do low/high computations if we have slots (they don't depend on cond yet)
                         valu_ops.append((">>", buf["cond"], buf["tmp2"], one_v))  # sel1
                         block["next_phase"] = "round2_select3"
                     elif phase == "round2_select3":
@@ -799,7 +895,6 @@ class KernelBuilder:
                 body_instrs.extend(self.build(tail_slots))
 
         self.instrs.extend(body_instrs)
-        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 

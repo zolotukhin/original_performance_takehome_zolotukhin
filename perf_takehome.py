@@ -126,8 +126,12 @@ class KernelBuilder:
         vector_batch_early = (batch_size // VLEN) * VLEN
         block_offset_values_early = list(range(0, vector_batch_early, VLEN))  # 0, 8, 16, ..., 248
         block_off_addrs = []
-        for i in range(len(block_offset_values_early)):
-            addr = self.alloc_scratch(f"block_off_{i}")
+        for i, off in enumerate(block_offset_values_early):
+            if off == 0:
+                # Share with zero_const for block 0 offset
+                addr = zero_const
+            else:
+                addr = self.alloc_scratch(f"block_off_{i}")
             block_off_addrs.append(addr)
 
         # Load only base offsets (every 4th); compute the rest with ALU adds
@@ -135,14 +139,21 @@ class KernelBuilder:
         eight_const = self.alloc_scratch("eight_const")
         sixteen_const = self.alloc_scratch("sixteen_const")
         twentyfour_const = self.alloc_scratch("twentyfour_const")
+        # Add to const_map so hash constants can reuse if they match
+        self.const_map[8] = eight_const
+        self.const_map[16] = sixteen_const
+        self.const_map[24] = twentyfour_const
 
-        # Build early block offset loads list
-        early_block_loads = []
+        # Build early block offset loads list - load 8,16,24 FIRST so they're available for ALU
+        early_block_loads = [
+            (eight_const, 8),
+            (sixteen_const, 16),
+            (twentyfour_const, 24),
+        ]
+        # Then base offsets (skip block 0 which is zero_const, already loaded)
         for i in base_indices:
-            early_block_loads.append((block_off_addrs[i], block_offset_values_early[i]))
-        early_block_loads.append((eight_const, 8))
-        early_block_loads.append((sixteen_const, 16))
-        early_block_loads.append((twentyfour_const, 24))
+            if block_off_addrs[i] != zero_const:
+                early_block_loads.append((block_off_addrs[i], block_offset_values_early[i]))
         early_load_idx = 0
 
         # OPTIMIZED: Pack 6 vbroadcasts WITH 2 early block offset loads
@@ -332,7 +343,7 @@ class KernelBuilder:
             else:
                 hash_mul_v.append(None)
 
-        # Phase 3: Interleave vbroadcasts with REMAINING block offset loads
+        # Phase 3: Interleave vbroadcasts with REMAINING block offset loads using pending_offset_ops
         # Some block offset loads already done in early interleaving above
         # Build remaining loads list from early_load_idx onwards
         remaining_block_loads = early_block_loads[early_load_idx:]
@@ -347,22 +358,35 @@ class KernelBuilder:
             if hash_mul_v[hi] is not None:
                 all_broadcasts.append(("vbroadcast", hash_mul_v[hi], mul_scalars[hi][1]))
 
-        # Pack: 2 const loads + 6 vbroadcasts per cycle while we have both
-        # Pre-compute ALU ops for block offsets (split by dependency)
-        # Ops using eight_const and sixteen_const can run after cycle 24
-        # Ops using twentyfour_const must wait until cycle 26 (after it's loaded in cycle 25)
-        early_alu_ops = []  # ops using eight_const or sixteen_const
-        late_alu_ops = []   # ops using twentyfour_const
+        # Build sets for tracking dependencies
+        base_addr_set = set()
+        base_targets = {}
         for base_idx in base_indices:
             base_addr = block_off_addrs[base_idx]
-            early_alu_ops.append(("+", block_off_addrs[base_idx + 1], base_addr, eight_const))
-            early_alu_ops.append(("+", block_off_addrs[base_idx + 2], base_addr, sixteen_const))
-            late_alu_ops.append(("+", block_off_addrs[base_idx + 3], base_addr, twentyfour_const))
+            base_addr_set.add(base_addr)
+            base_targets[base_addr] = (
+                block_off_addrs[base_idx + 1],
+                block_off_addrs[base_idx + 2],
+                block_off_addrs[base_idx + 3],
+            )
+        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
+
+        # Track which addresses were loaded in early phase
+        early_loaded_base_addrs = {addr for addr, _ in early_block_loads[:early_load_idx] if addr in base_addr_set}
+        early_loaded_const_addrs = {addr for addr, _ in early_block_loads[:early_load_idx] if addr in const_addr_set}
+
+        # Use pending_offset_ops to dynamically enqueue ALU ops when dependencies are ready
+        pending_offset_ops = []
+        loaded_base_addrs = set(early_loaded_base_addrs)
+        # zero_const is already loaded (it's one of the first constants)
+        if block_off_addrs[0] == zero_const:
+            loaded_base_addrs.add(zero_const)
+        enqueued_base_addrs = set()
+        loaded_const_addrs = set(early_loaded_const_addrs)
 
         bc_idx = 0
-        rem_idx = 0
-        early_alu_idx = 0
-        while bc_idx < len(all_broadcasts) or rem_idx < len(remaining_block_loads):
+        const_idx = 0
+        while bc_idx < len(all_broadcasts) or const_idx < len(remaining_block_loads) or pending_offset_ops:
             bundle = {}
 
             # Add up to 6 vbroadcasts
@@ -375,36 +399,50 @@ class KernelBuilder:
 
             # Add up to 2 const loads from remaining
             load_ops = []
-            while len(load_ops) < 2 and rem_idx < len(remaining_block_loads):
-                addr, val = remaining_block_loads[rem_idx]
+            loaded_bases_this_cycle = []
+            loaded_consts_this_cycle = []
+            while len(load_ops) < 2 and const_idx < len(remaining_block_loads):
+                addr, val = remaining_block_loads[const_idx]
                 load_ops.append(("const", addr, val))
-                rem_idx += 1
+                if addr in base_addr_set:
+                    loaded_bases_this_cycle.append(addr)
+                elif addr in const_addr_set:
+                    loaded_consts_this_cycle.append(addr)
+                const_idx += 1
             if load_ops:
                 bundle["load"] = load_ops
 
-            # Add early ALU ops to the last bundle (when twentyfour_const is being loaded)
-            # This is the cycle where rem_idx points past the last load (or is at twentyfour)
-            if rem_idx >= len(remaining_block_loads) and early_alu_idx < len(early_alu_ops):
-                alu_chunk = early_alu_ops[early_alu_idx:early_alu_idx + SLOT_LIMITS["alu"]]
-                if alu_chunk:
-                    bundle["alu"] = alu_chunk
-                    early_alu_idx += len(alu_chunk)
+            # Add up to 12 ALU ops from pending queue
+            alu_ops = []
+            while pending_offset_ops and len(alu_ops) < SLOT_LIMITS["alu"]:
+                alu_ops.append(pending_offset_ops.pop(0))
+            if alu_ops:
+                bundle["alu"] = alu_ops
+
+            # Check if this is the last iteration
+            is_last = not (bc_idx < len(all_broadcasts) or const_idx < len(remaining_block_loads) or pending_offset_ops)
 
             if bundle:
+                # Add pause to the last bundle (saves 1 cycle vs separate pause)
+                if is_last:
+                    bundle["flow"] = [("pause",)]
                 self.add_packed(bundle)
 
-        # Combine remaining early ALU ops with late ALU ops and pause
-        remaining_early = early_alu_ops[early_alu_idx:]
-        all_remaining_alu = remaining_early + late_alu_ops
-        # These should fit in one or two cycles depending on count
-        while all_remaining_alu:
-            chunk = all_remaining_alu[:SLOT_LIMITS["alu"]]
-            all_remaining_alu = all_remaining_alu[SLOT_LIMITS["alu"]:]
-            if not all_remaining_alu:
-                # Last chunk, add pause
-                self.add_packed({"alu": chunk, "flow": [("pause",)]})
-            else:
-                self.add_packed({"alu": chunk})
+            # Update loaded sets and enqueue new ALU ops when deps are ready
+            loaded_base_addrs.update(loaded_bases_this_cycle)
+            loaded_const_addrs.update(loaded_consts_this_cycle)
+            constants_ready = len(loaded_const_addrs) == len(const_addr_set)
+            if constants_ready:
+                for base_addr in loaded_base_addrs:
+                    if base_addr in enqueued_base_addrs:
+                        continue
+                    t1, t2, t3 = base_targets[base_addr]
+                    pending_offset_ops.extend([
+                        ("+", t1, base_addr, eight_const),
+                        ("+", t2, base_addr, sixteen_const),
+                        ("+", t3, base_addr, twentyfour_const),
+                    ])
+                    enqueued_base_addrs.add(base_addr)
         body_instrs = []
 
         buffers = []
@@ -446,19 +484,17 @@ class KernelBuilder:
                     return False
                 buf_idx = free_bufs.pop(0)
                 buf = buffers[buf_idx]
-                # Optimization: block 0's offset is 0, so idx_addr = inp_indices_p, val_addr = inp_values_p
-                # Skip init_addr phase and go directly to vload
+                # Block 0 optimization: offset is 0, so use base pointers directly
                 if next_block == 0:
                     active.append({
                         "block": next_block,
                         "buf_idx": buf_idx,
                         "buf": buf,
                         "offset": block_offsets[next_block],
-                        "phase": "vload",  # Skip init_addr for block 0
+                        "phase": "vload",  # Skip init_addr
                         "round": 0,
                         "stage": 0,
                         "gather": 0,
-                        # Store direct scratch addresses for block 0's vload/vstore
                         "direct_idx_addr": self.scratch["inp_indices_p"],
                         "direct_val_addr": self.scratch["inp_values_p"],
                     })
@@ -555,7 +591,6 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_both" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        # Use direct addresses if available (block 0 optimization)
                         val_addr = block.get("direct_val_addr", buf["val_addr"])
                         store_ops.append(("vstore", val_addr, buf["val"]))
                         block["next_phase"] = "store_idx"
@@ -567,7 +602,6 @@ class KernelBuilder:
                         break
                     if block["phase"] == "store_idx" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        # Use direct addresses if available (block 0 optimization)
                         idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
                         store_ops.append(("vstore", idx_addr, buf["idx"]))
                         block["next_phase"] = "done"
@@ -580,7 +614,6 @@ class KernelBuilder:
                         break
                     if block["phase"] == "vload" and block["block"] not in scheduled_this_cycle:
                         buf = block["buf"]
-                        # Use direct addresses if available (block 0 optimization)
                         idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
                         val_addr = block.get("direct_val_addr", buf["val_addr"])
                         load_ops.append(("vload", buf["idx"], idx_addr))
@@ -862,7 +895,6 @@ class KernelBuilder:
                 body_instrs.extend(self.build(tail_slots))
 
         self.instrs.extend(body_instrs)
-        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
