@@ -1,0 +1,314 @@
+--- 1456_stable.py	2026-01-21 18:01:58
++++ solution_new.py	2026-01-21 18:24:13
+@@ -573,7 +573,6 @@
+                     "tmp1": self.alloc_scratch(f"tmp1_v{bi}", VLEN),
+                     "tmp2": self.alloc_scratch(f"tmp2_v{bi}", VLEN),
+                     "cond": self.alloc_scratch(f"cond_v{bi}", VLEN),
+-                    "idx_addr": self.alloc_scratch(f"idx_addr{bi}"),
+                     "val_addr": self.alloc_scratch(f"val_addr{bi}"),
+                 }
+             )
+@@ -599,36 +598,16 @@
+                 if next_block >= vector_blocks or not free_bufs:
+                     return False
+                 buf_idx = free_bufs.pop(0)
+-                buf = buffers[buf_idx]
+-                # Block 0 optimization: offset is 0, so use base pointers directly
+-                if next_block == 0:
+-                    active.append(
+-                        {
+-                            "block": next_block,
+-                            "buf_idx": buf_idx,
+-                            "buf": buf,
+-                            "offset": block_offsets[next_block],
+-                            "phase": "vload",  # Skip init_addr
+-                            "round": 0,
+-                            "stage": 0,
+-                            "gather": 0,
+-                            "direct_idx_addr": self.scratch["inp_indices_p"],
+-                            "direct_val_addr": self.scratch["inp_values_p"],
+-                        }
+-                    )
+-                else:
+-                    active.append(
+-                        {
+-                            "block": next_block,
+-                            "buf_idx": buf_idx,
+-                            "buf": buf,
+-                            "offset": block_offsets[next_block],
+-                            "phase": "init_addr",
+-                            "round": 0,
+-                            "stage": 0,
+-                            "gather": 0,
+-                        }
+-                    )
++                active.append({
++                    "block": next_block,
++                    "buf_idx": buf_idx,
++                    "buf": buffers[buf_idx],
++                    "offset": block_offsets[next_block],
++                    "phase": "init_addr",
++                    "round": 0,
++                    "stage": 0,
++                    "gather": 0,
++                })
+                 next_block += 1
+                 return True
+ 
+@@ -662,7 +641,7 @@
+                     """Determine next phase after completing a round."""
+                     next_r = current_round + 1
+                     if next_r >= rounds:
+-                        return "store_both"
++                        return "store_val"
+ 
+                     # Calculate effective depth
+                     # For rounds 0-wrap_threshold, depth = next_r
+@@ -690,77 +669,43 @@
+                     else:
+                         return "addr"  # Gather for depth >= 3
+ 
+-                # Priority 1: Flow operations (vselect for bounds) - only for rounds >= wrap_threshold
+-                update4_blocks = [
+-                    b
+-                    for b in active
+-                    if b["phase"] == "update4"
+-                    and b["block"] not in scheduled_this_cycle
+-                ]
+-                update4_blocks.sort(key=lambda b: b["round"], reverse=True)
+-                for block in update4_blocks:
+-                    if flow_slots == 0:
+-                        break
+-                    buf = block["buf"]
+-                    flow_ops.append(
+-                        ("vselect", buf["idx"], buf["cond"], buf["idx"], zero_v)
+-                    )
+-                    block["round"] += 1
+-                    block["stage"] = 0
+-                    block["gather"] = 0
+-                    block["next_phase"] = next_round_phase(block["round"] - 1)
+-                    scheduled_this_cycle.add(block["block"])
+-                    flow_slots -= 1
++                # Priority 1: Flow operations - not needed anymore with wrap_reset
+ 
+-                # Priority 2: Stores (2 per cycle)
++                # Priority 2: Stores (only val, not idx)
+                 for block in active:
+                     if store_slots == 0:
+                         break
+                     if (
+-                        block["phase"] == "store_both"
++                        block["phase"] == "store_val"
+                         and block["block"] not in scheduled_this_cycle
+                     ):
+                         buf = block["buf"]
+-                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+-                        store_ops.append(("vstore", val_addr, buf["val"]))
+-                        block["next_phase"] = "store_idx"
+-                        scheduled_this_cycle.add(block["block"])
+-                        store_slots -= 1
+-
+-                for block in active:
+-                    if store_slots == 0:
+-                        break
+-                    if (
+-                        block["phase"] == "store_idx"
+-                        and block["block"] not in scheduled_this_cycle
+-                    ):
+-                        buf = block["buf"]
+-                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+-                        store_ops.append(("vstore", idx_addr, buf["idx"]))
++                        store_ops.append(("vstore", buf["val_addr"], buf["val"]))
+                         block["next_phase"] = "done"
+                         scheduled_this_cycle.add(block["block"])
+                         store_slots -= 1
+ 
+-                # Priority 3: Vloads (need 2 load slots)
++                # Priority 3: Vloads (need 1 load slot for val, set idx=0 via VALU)
+                 for block in active:
+-                    if load_slots < 2:
++                    if load_slots < 1:
+                         break
+                     if (
+                         block["phase"] == "vload"
+                         and block["block"] not in scheduled_this_cycle
+                     ):
+                         buf = block["buf"]
+-                        idx_addr = block.get("direct_idx_addr", buf["idx_addr"])
+-                        val_addr = block.get("direct_val_addr", buf["val_addr"])
+-                        load_ops.append(("vload", buf["idx"], idx_addr))
+-                        load_ops.append(("vload", buf["val"], val_addr))
++                        load_ops.append(("vload", buf["val"], buf["val_addr"]))
++                        # Set idx = 0 via VALU (saves a vload)
++                        if valu_slots >= 1:
++                            valu_ops.append(("+", buf["idx"], zero_v, zero_v))
++                            valu_slots -= 1
+                         # For round 0, skip addr and gather phases (all idx=0, use tree0_v)
+                         if block["round"] == 0:
+                             block["next_phase"] = "round0_xor"
+                         else:
+                             block["next_phase"] = "addr"
+                         scheduled_this_cycle.add(block["block"])
+-                        load_slots -= 2
++                        load_slots -= 1
+ 
+                 # Priority 4: Gather loads (fill remaining load slots from multiple blocks)
+                 # Skip gather for round 0 - use tree0_v directly
+@@ -796,45 +741,36 @@
+                     phase = block["phase"]
+                     buf = block["buf"]
+                     # Priority 0 = highest (closer to completion)
+-                    if phase == "update3":
+-                        valu_tasks.append((0, 1, block, "update3"))
++                    if phase == "wrap_reset":
++                        valu_tasks.append((0, 1, block, "wrap_reset"))
+                     elif phase == "update2":
+                         valu_tasks.append((1, 1, block, "update2"))
+                     elif phase == "update1":
+                         valu_tasks.append((2, 2, block, "update1"))
+                     elif phase == "hash_op2":
+-                        valu_tasks.append((5, 1, block, "hash_op2"))
++                        valu_tasks.append((6, 1, block, "hash_op2"))
+                     elif phase == "hash_mul":
+-                        valu_tasks.append((7, 1, block, "hash_mul"))
++                        valu_tasks.append((5, 1, block, "hash_mul"))
+                     elif phase == "hash_op1":
+-                        valu_tasks.append((5, 1, block, "hash_op1"))
++                        valu_tasks.append((4, 1, block, "hash_op1"))
+                     elif phase == "xor":
+                         valu_tasks.append((7, 1, block, "xor"))
+                     elif phase == "round0_xor":
+                         valu_tasks.append((7, 1, block, "round0_xor"))
+                     elif phase == "round1_select":
+-                        valu_tasks.append(
+-                            (7, 1, block, "round1_select")
+-                        )  # optimized from 6 to 7
++                        valu_tasks.append((7, 1, block, "round1_select"))
+                     elif phase == "round2_select1":
+-                        valu_tasks.append(
+-                            (6, 1, block, "round2_select1")
+-                        )  # offset, priority 6
++                        valu_tasks.append((7, 1, block, "round2_select1"))
+                     elif phase == "round2_select2":
+-                        valu_tasks.append(
+-                            (4, 1, block, "round2_select2")
+-                        )  # sel1, priority 4 (optimized)
++                        valu_tasks.append((4, 1, block, "round2_select2"))
+                     elif phase == "round2_select3":
+-                        valu_tasks.append(
+-                            (6, 2, block, "round2_select3")
+-                        )  # low, high, priority 6
++                        valu_tasks.append((6, 2, block, "round2_select3"))
+                     elif phase == "round2_select4":
+-                        valu_tasks.append((6, 1, block, "round2_select4"))  # diff
++                        valu_tasks.append((7, 1, block, "round2_select4"))
+                     elif phase == "round2_select5":
+-                        valu_tasks.append((6, 1, block, "round2_select5"))  # node
++                        valu_tasks.append((6, 1, block, "round2_select5"))
+                     elif phase == "addr":
+-                        # Optimized priority (5) for better scheduling
+-                        valu_tasks.append((5, 1, block, "addr"))
++                        valu_tasks.append((4, 1, block, "addr"))
+ 
+                 # Sort by priority (lower = higher priority)
+                 valu_tasks.sort(key=lambda x: x[0])
+@@ -884,22 +820,24 @@
+                     if valu_slots < cost:
+                         continue
+ 
+-                    if phase == "update3":
+-                        valu_ops.append(("<", buf["cond"], buf["idx"], n_nodes_v))
+-                        block["next_phase"] = "update4"
++                    if phase == "wrap_reset":
++                        # At wrap_threshold, all indices exceed n_nodes, so reset to 0
++                        valu_ops.append(("+", buf["idx"], zero_v, zero_v))
++                        block["round"] += 1
++                        block["stage"] = 0
++                        block["gather"] = 0
++                        block["next_phase"] = next_round_phase(block["round"] - 1)
+                     elif phase == "update2":
+                         valu_ops.append(("+", buf["idx"], buf["idx"], buf["tmp1"]))
+-                        # Skip wrap check for rounds where idx can't exceed n_nodes:
+-                        # - Rounds 0-9 (before wrap): idx grows but stays < n_nodes
+-                        # - Rounds 11-15 (after wrap): idx reset to 0 and grows small
+-                        # Only round 10 (wrap_threshold) needs the wrap check
+-                        if block["round"] != wrap_threshold:
++                        # At wrap_threshold, go to wrap_reset to set idx=0
++                        # At other rounds, proceed to next round directly
++                        if block["round"] == wrap_threshold:
++                            block["next_phase"] = "wrap_reset"
++                        else:
+                             block["round"] += 1
+                             block["stage"] = 0
+                             block["gather"] = 0
+                             block["next_phase"] = next_round_phase(block["round"] - 1)
+-                        else:
+-                            block["next_phase"] = "update3"
+                     elif phase == "update1":
+                         # Offload AND to scalar ALU when slots available (like hash_op1)
+                         if alu_slots >= VLEN and valu_slots >= 1:
+@@ -930,7 +868,13 @@
+                         op2 = HASH_STAGES[hi][2]
+                         valu_ops.append((op2, buf["val"], buf["tmp1"], buf["tmp2"]))
+                         if hi + 1 == len(HASH_STAGES):
+-                            block["next_phase"] = "update1"
++                            # After last hash stage, check for wrap or store
++                            if block["round"] == rounds - 1:
++                                block["next_phase"] = "store_val"
++                            elif block["round"] == wrap_threshold:
++                                block["next_phase"] = "wrap_reset"
++                            else:
++                                block["next_phase"] = "update1"
+                         else:
+                             block["stage"] = hi + 1
+                             block["next_phase"] = (
+@@ -951,7 +895,13 @@
+                             )
+                         )
+                         if hi + 1 == len(HASH_STAGES):
+-                            block["next_phase"] = "update1"
++                            # After last hash stage, check for wrap or store
++                            if block["round"] == rounds - 1:
++                                block["next_phase"] = "store_val"
++                            elif block["round"] == wrap_threshold:
++                                block["next_phase"] = "wrap_reset"
++                            else:
++                                block["next_phase"] = "update1"
+                         else:
+                             block["stage"] = hi + 1
+                             block["next_phase"] = (
+@@ -1038,23 +988,15 @@
+                     scheduled_this_cycle.add(block["block"])
+                     valu_slots -= cost
+ 
+-                # Priority 6: ALU for init_addr (2 slots each)
++                # Priority 6: ALU for init_addr (1 slot each - only val_addr now)
+                 for block in active:
+-                    if alu_slots < 2:
++                    if alu_slots < 1:
+                         break
+                     if (
+                         block["phase"] == "init_addr"
+                         and block["block"] not in scheduled_this_cycle
+                     ):
+                         buf = block["buf"]
+-                        alu_ops.append(
+-                            (
+-                                "+",
+-                                buf["idx_addr"],
+-                                self.scratch["inp_indices_p"],
+-                                block["offset"],
+-                            )
+-                        )
+                         alu_ops.append(
+                             (
+                                 "+",
+@@ -1065,7 +1007,7 @@
+                         )
+                         block["next_phase"] = "vload"
+                         scheduled_this_cycle.add(block["block"])
+-                        alu_slots -= 2
++                        alu_slots -= 1
+ 
+                 if not (alu_ops or load_ops or valu_ops or store_ops or flow_ops):
+                     # Check if any block is in gather phase but wasn't fully scheduled
